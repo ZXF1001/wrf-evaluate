@@ -1,7 +1,7 @@
 """只读扫描原始文件；不解压、不解析观测时间、不修改数据。"""
 
 from bisect import insort
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 import os
@@ -52,7 +52,9 @@ def scan_source(source: SourceConfig, example_limit: int = 3) -> ScanResult:
     return ScanResult(source.name, count, total_bytes, tuple(examples))
 
 
-def iter_source_files(source: SourceConfig) -> Iterator[Path]:
+def iter_source_files(
+    source: SourceConfig, *, include_directory: Callable[[Path], bool] | None = None,
+) -> Iterator[Path]:
     """站点直接返回配置文件列表；网格来源流式扫描，不保存全量清单。"""
     if not source.enabled:
         return
@@ -63,6 +65,8 @@ def iter_source_files(source: SourceConfig) -> Iterator[Path]:
     pending = [source.root]
     while pending:
         directory = pending.pop()
+        if include_directory is not None and not include_directory(directory):
+            continue
         with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.is_symlink():

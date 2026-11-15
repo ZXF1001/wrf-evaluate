@@ -13,7 +13,7 @@ from wrf_evaluate.cldas import CldasPointSample, parse_cldas_filename
 from wrf_evaluate.config import Config, ConfigError, PeriodConfig, PointConfig, SourceConfig, load_config
 from wrf_evaluate.station import StationObservation
 from wrf_evaluate.workflow import _wrf_series, plot_comparisons
-from wrf_evaluate.forecasts import eligible_series, forecast_init_time, select_latest
+from wrf_evaluate.forecasts import eligible_series, forecast_init_time, iter_wrf_files, select_latest
 from wrf_evaluate.evaluation import compare_forecast
 from wrf_evaluate.series import Series
 from wrf_evaluate.variables import VariableConfig
@@ -45,7 +45,7 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.rows = [self.row(minutes, value) for minutes, value in ((10, 1), (0, 0), (5, None), (-5, 99), (65, 99))]
         self.rows.append(replace(self.row(0, 99), station_id='other'))
 
-        def files(source):
+        def files(source, **kwargs):
             return iter(source.files if source.kind == 'regional' else self.files[source.name])
 
         def sample(path, *args):
@@ -53,6 +53,7 @@ class ComparisonWorkflowTests(unittest.TestCase):
             return {name: tuple(CldasPointSample(path, info.time, None, 274.15, 'K') for _ in args[1]) for name in args[0]}
 
         self.start_patch('wrf_evaluate.workflow.iter_source_files', side_effect=files)
+        self.start_patch('wrf_evaluate.forecasts.iter_source_files', side_effect=files)
         self.start_patch('wrf_evaluate.matching.iter_source_files', side_effect=files)
         self.read_frames = self.start_patch('wrf_evaluate.workflow.iter_wrf_points_frames', side_effect=lambda *args, **kwargs: (tuple(frame for _ in args[3]) for frame in self.frames))
         self.read_station = self.start_patch('wrf_evaluate.workflow.iter_regional_observations', side_effect=lambda *args, **kwargs: (row for row in self.rows if row.station_id in kwargs['station_ids'] and kwargs['period'].start <= row.time <= kwargs['period'].end))
@@ -295,6 +296,16 @@ class ComparisonWorkflowTests(unittest.TestCase):
         comparison, = compare_forecast(result, observed, timedelta(0), 'precipitation')
         self.assertEqual(comparison.metrics.mae, 0)  # 新批次不能完整覆盖窗口，使用旧批次的 2+2。
 
+    def test_cumulative_point_values_cannot_difference_across_moving_grid(self):
+        source = replace(self.wrf, variable_mapping=(
+            ('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),))
+        self.frames = [replace(frame, values={'RAINNC': i}, units={'RAINNC': 'mm'},
+                               grid_coordinates=(87.5 + i * 0.01, 43.5))
+                       for i, frame in enumerate(self.frames)]
+        config = replace(self.config, sources=(source,), elements=('precipitation',))
+        with self.assertRaisesRegex(ValueError, '网格发生移动'):
+            _wrf_series(source, config)
+
 
 class ForecastSelectionTests(unittest.TestCase):
     def setUp(self):
@@ -312,6 +323,16 @@ class ForecastSelectionTests(unittest.TestCase):
                     with self.assertRaises(ConfigError):
                         load_config('config.toml')
 
+    def test_lead_configuration_caps_minimum_and_defaults_to_seven_days(self):
+        text = b'[sources.wrf]\nkind="wrf"\nroot="raw"\npatterns=["*"]\ntimezone="UTC"\n'
+        with patch.object(Path, 'is_dir', return_value=True), patch.object(Path, 'exists', return_value=False):
+            with patch.object(Path, 'read_bytes', return_value=text):
+                self.assertEqual(load_config('config.toml').sources[0].max_lead_hours, 168)
+            invalid = text + b'min_lead_hours=169\nmax_lead_hours=168\n'
+            with patch.object(Path, 'read_bytes', return_value=invalid):
+                with self.assertRaisesRegex(ConfigError, 'min_lead_hours'):
+                    load_config('config.toml')
+
     def test_directory_timezone_root_and_file_attribute_fallback(self):
         source = replace(self.source, timezone='Asia/Shanghai')
         self.assertEqual(forecast_init_time(source, Path('wrf/2024122408/nested/file')), self.time)
@@ -324,6 +345,48 @@ class ForecastSelectionTests(unittest.TestCase):
             forecast_init_time(replace(source, min_lead_hours=1), Path('wrf/file'))
         with self.assertRaisesRegex(ValueError, '多个'):
             forecast_init_time(source, Path('wrf/2024122408/2024122409/file'))
+
+    def test_filename_interval_filter_keeps_previous_multi_time_file(self):
+        period = PeriodConfig(
+            datetime(2024, 12, 10, 3, 5, tzinfo=timezone.utc),
+            datetime(2024, 12, 10, 3, 15, tzinfo=timezone.utc),
+        )
+        paths = [Path(f'wrf/2024121000/wrfout_d03_2024-12-10_{time}')
+                 for time in ('02_50_00', '03_00_00', '03_10_00', '03_20_00')]
+        source = replace(self.source, max_lead_hours=168)
+
+        def scan(_source, *, include_directory):
+            directory = Path('wrf/2024121000')
+            if include_directory(directory):
+                yield from paths
+
+        with patch('wrf_evaluate.forecasts.iter_source_files', side_effect=scan):
+            selected = list(iter_wrf_files(source, period))
+        # 文件时间段按 [本文件名, 下一文件名) 解释；3 点前文件装有 3:10 之前的数据。
+        self.assertEqual(selected, paths[1:3])
+
+    def test_seven_day_bound_prunes_old_runs_before_listing_files(self):
+        period = PeriodConfig(
+            datetime(2024, 12, 10, tzinfo=timezone.utc),
+            datetime(2024, 12, 10, 3, tzinfo=timezone.utc),
+        )
+        old = Path('wrf/2024120100/wrfout_d03_2024-12-01_00_00_00')
+        new = Path('wrf/2024121000/wrfout_d03_2024-12-10_00_00_00')
+        files = [old, new]
+        decisions = []
+
+        def scan(_source, *, include_directory):
+            for path in files:
+                directory = path.parent
+                decision = include_directory(directory)
+                decisions.append((directory, decision))
+                if decision:
+                    yield path
+
+        with patch('wrf_evaluate.forecasts.iter_source_files', side_effect=scan):
+            selected = list(iter_wrf_files(self.source, period))
+        self.assertEqual(selected, [new])
+        self.assertIn((old.parent, False), decisions)
 
     def test_latest_missing_value_does_not_fall_back_to_old_run(self):
         times = (self.time, self.time + timedelta(hours=1))
@@ -352,3 +415,10 @@ class ForecastSelectionTests(unittest.TestCase):
         comparison, = compare_forecast(result, old, timedelta(0), 'precipitation')
         self.assertEqual(comparison.matched_times, 1)
         self.assertEqual(comparison.metrics.sample_count, 0)
+
+    def test_lead_upper_bound_checks_interval_end_not_just_timestamp(self):
+        end = self.time + timedelta(hours=1)
+        curve = Series('wrf', (self.time, end), (1, 2),
+                       ((self.time, end), (end, end + timedelta(hours=1))), 'sum', 'mm')
+        self.assertEqual(eligible_series(curve, self.time, end).values, (1,))
+        self.assertIsNone(eligible_series(curve, None, self.time))

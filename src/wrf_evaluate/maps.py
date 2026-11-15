@@ -1,7 +1,7 @@
 """按配置时间绘制 WRF/CLDAS 空间场；仅加载当前比较所需的场。"""
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from zoneinfo import ZoneInfo
@@ -16,7 +16,7 @@ from .config import Config, SourceConfig
 from .forecasts import run_order, valid_from
 from .plotting import plot_style
 from .variables import UNITS, VariableConfig, convert_value
-from .wrf import read_wrf_fields
+from .wrf import read_wrf_fields, resolve_wrf_variable
 
 
 GridField = tuple[np.ndarray, np.ndarray, np.ma.MaskedArray]
@@ -28,7 +28,7 @@ def _converted(field: str, values: np.ma.MaskedArray, units: str, spec: Variable
     # 所有已支持单位均为线性换算，复用点位转换规则，避免逐格 Python 循环。
     zero = convert_value(field, 0.0, spec.units or units, spec.time_kind, spec.interval)
     one = convert_value(field, 1.0, spec.units or units, spec.time_kind, spec.interval)
-    result = np.ma.masked_invalid(values, copy=False) * (one - zero) + zero
+    result = np.ma.masked_invalid(np.ma.asarray(values, dtype=np.float64), copy=False) * (one - zero) + zero
     if field == "precipitation" and np.ma.any(result < 0):
         raise ValueError("有效降水量不能为负，请核对缺测码与累计规则")
     return result
@@ -81,15 +81,18 @@ def _forecast_field(
             progress(f"读取空间场 {field}：{frame_index}/{len(selected)} 个时次")
             last_report = now
         path, index = frames[time]
-        fields = read_wrf_fields(path, (spec.variable, "XLONG", "XLAT"), index)
+        fields = read_wrf_fields(path, (*spec.native_variables, "XLONG", "XLAT"), index)
         coordinates = fields["XLONG"].values, fields["XLAT"].values
         if any(np.ma.getmaskarray(axis).any() for axis in coordinates):
             raise ValueError(f"{path}: 空间图坐标含缺测")
         if grid is not None and not all(np.array_equal(x, y) for x, y in zip(grid, coordinates)):
             raise ValueError("目标时段内 WRF 网格移动，不能直接逐格累计或差分")
         grid = coordinates
-        native = fields[spec.variable]
-        value = _converted(field, native.values, native.units, spec)
+        native, units = resolve_wrf_variable(
+            spec, {name: item.values for name, item in fields.items()},
+            {name: item.units for name, item in fields.items()},
+        )
+        value = _converted(field, native, units, spec)
         if spec.time_kind == "cumulative":
             before, previous = previous, value
             if before is None:
@@ -119,6 +122,8 @@ def _latest_field(
     for init_time, frames in sorted(runs.items(), key=lambda item: run_order(item[0]), reverse=True):
         cutoff = valid_from(source, init_time)
         if cutoff is not None and start < cutoff:
+            continue
+        if init_time is not None and end > init_time + timedelta(hours=source.max_lead_hours):
             continue
         result = _forecast_field(frames, field, spec, start, end, progress)
         if result is not None:

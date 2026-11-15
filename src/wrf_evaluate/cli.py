@@ -69,7 +69,8 @@ def main(argv: list[str] | None = None) -> int:
             for source in enabled:
                 print(f"  {source.name} ({source.kind}, {source.timezone}): {source.root}")
                 if source.kind == "wrf":
-                    print(f"    最低预报时效: {source.min_lead_hours:g} 小时；同一有效时刻选最新合格起报")
+                    print(f"    最低预报时效: {source.min_lead_hours:g} 小时；"
+                          f"最长预报时效: {source.max_lead_hours:g} 小时；同一有效时刻选最新合格起报")
                 if source.kind in {"regional", "national"}:
                     print(f"    显式指定 {len(source.files)} 个 Excel 文件" + ("；尚未选入实测文件" if not source.files else ""))
             print(f"输出父目录: {config.output_dir}；运行目录: {config.output_name}_运行时间（本命令不创建目录）")

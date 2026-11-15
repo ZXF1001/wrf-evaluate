@@ -25,14 +25,19 @@ UNITS = {
 
 @dataclass(frozen=True)
 class VariableConfig:
-    """One native variable and how its values represent time and physical units."""
+    """Native field (or WRF wind components), units and time semantics."""
 
-    variable: str
+    variable: str | None
     units: str | None = None
     time_kind: str | None = "instant"
     interval: timedelta | None = None
     timestamp: str | None = None
     product: str | None = None
+    components: tuple[str, ...] = ()
+
+    @property
+    def native_variables(self) -> tuple[str, ...]:
+        return self.components or ((self.variable,) if self.variable else ())
 
 
 # Defaults are only for fields verified in the supplied data templates.
@@ -40,6 +45,7 @@ class VariableConfig:
 DEFAULT_VARIABLES = {
     "wrf": {
         "temperature_2m": VariableConfig("T2"),
+        "wind_speed_10m": VariableConfig(None, components=("U10", "V10")),
     },
     "cldas": {
         "temperature_2m": VariableConfig("TAIR", product="TMP"),
@@ -93,14 +99,35 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
         allowed_options = {"variable"} if simple_field else {
             "variable", "units", "time_kind", "interval", "timestamp",
         } | ({"product"} if kind == "cldas" else set())
+        if kind == "wrf" and field == "wind_speed_10m":
+            allowed_options.add("components")
         if unknown := options.keys() - allowed_options:
             raise ValueError(f"{field}: 未知配置项 {', '.join(sorted(unknown))}")
 
         base = defaults.get(field)
-        if base is None and "variable" not in options:
-            raise ValueError(f"{field}.variable: 请指定一个原始变量名")
+        if base is None and not {"variable", "components"}.intersection(options):
+            raise ValueError(f"{field}.variable: 请指定原始变量名")
         updates = {}
-        for key in ("variable", "units", "time_kind", "timestamp", "product"):
+        if "components" in options:
+            if "variable" in options:
+                raise ValueError(f"{field}: variable 与 components 只能配置一项")
+            components = options["components"]
+            if (not isinstance(components, list) or len(components) != 2
+                    or any(not isinstance(item, str) or not item.strip() for item in components)
+                    or len({item.strip() for item in components}) != 2):
+                raise ValueError(f"{field}.components: WRF 10 米风速须为两个不同的原始分量名")
+            updates["components"] = tuple(item.strip() for item in components)
+            updates["variable"] = None
+        elif "variable" in options:
+            text = options["variable"]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"{field}.variable: 应为非空字符串")
+            text = text.strip()
+            if kind == "wrf" and field == "wind_speed_10m" and text.upper() in {"U10", "V10", "U", "V"}:
+                raise ValueError(f"{field}.variable: {text} 是风分量，不是风速；请使用 components = [\"U10\", \"V10\"]")
+            updates["variable"] = text
+            updates["components"] = ()
+        for key in ("units", "time_kind", "timestamp", "product"):
             if key not in options:
                 continue
             text = options[key]
@@ -113,7 +140,7 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
         # Changing the statistic invalidates any interval inherited from a template.
         if "time_kind" in updates and base and updates["time_kind"] != base.time_kind:
             base = replace(base, interval=None, timestamp=None)
-        spec = replace(base or VariableConfig(options["variable"]), **updates)
+        spec = replace(base or VariableConfig(options.get("variable")), **updates)
         if not simple_field:
             validate_variable(field, spec)
         result[field] = spec

@@ -16,8 +16,9 @@ from wrf_evaluate.spatial import nearest_grid_point
 from wrf_evaluate.config import PeriodConfig
 from wrf_evaluate.wrf import (
     WrfField, WrfReadError, iter_wrf_point_frames, iter_wrf_points_frames, read_wrf_field,
-    read_wrf_fields, read_wrf_header, sample_wrf_station,
+    read_wrf_fields, read_wrf_header, resolve_wrf_variable, sample_wrf_station,
 )
+from wrf_evaluate.variables import VariableConfig
 
 
 class WrfReaderTests(unittest.TestCase):
@@ -62,6 +63,36 @@ class WrfReaderTests(unittest.TestCase):
         np.testing.assert_array_equal(field.values.mask, [[False, True, True], [False, False, False]])
         self.assertEqual(field.values[1, 2], 277)
         self.assertAlmostEqual(float(read_wrf_field(self.path, "T2").values[0, 0]), 273.15, places=4)
+
+    def test_ten_meter_wind_components_are_combined_and_propagate_missing_values(self):
+        spec = VariableConfig(None, components=('U10', 'V10'))
+        values, units = resolve_wrf_variable(
+            spec, {'U10': 3.0, 'V10': 4.0}, {'U10': 'm s-1', 'V10': 'm s-1'},
+        )
+        self.assertEqual(values, 5.0)
+        self.assertEqual(units, 'm/s')
+        missing, _ = resolve_wrf_variable(
+            spec, {'U10': 3.0, 'V10': None}, {'U10': 'm s-1', 'V10': 'm s-1'},
+        )
+        self.assertIsNone(missing)
+        arrays, _ = resolve_wrf_variable(
+            spec, {'U10': np.ma.array([3., 3.], mask=[False, True]),
+                   'V10': np.ma.array([4., 4.])},
+            {'U10': 'm/s', 'V10': 'm/s'},
+        )
+        self.assertEqual(arrays[0], 5.0)
+        self.assertTrue(np.ma.is_masked(arrays[1]))
+
+    def test_staggered_three_dimensional_fields_are_rejected_with_guidance(self):
+        with Dataset(self.path, 'a') as dataset:
+            dataset.createDimension('west_east_stag', 4)
+            dataset.createDimension('south_north_stag', 3)
+            dataset.createDimension('bottom_top', 1)
+            dataset.createVariable('U', 'f4', ('Time', 'bottom_top', 'south_north', 'west_east_stag'))
+            dataset.createVariable('V', 'f4', ('Time', 'bottom_top', 'south_north_stag', 'west_east'))
+        for name in ('U', 'V'):
+            with self.subTest(name=name), self.assertRaisesRegex(WrfReadError, '交错网格'):
+                read_wrf_field(self.path, name)
 
     def test_multiple_fields_share_one_open_and_keep_independent_units(self):
         with Dataset(self.path, "a") as dataset:
@@ -157,6 +188,15 @@ class WrfReaderTests(unittest.TestCase):
         self.assertEqual([frame.time_index for frame in frames], [1])
         self.assertEqual(frames[0].time, period.end)
         locate.assert_called_once()
+
+    def test_point_frames_exclude_times_after_maximum_forecast_lead(self):
+        self.add_coordinates()
+        init_time = datetime(2024, 12, 23, 22, tzinfo=timezone.utc)
+        frames = list(iter_wrf_point_frames(
+            self.path, ["T2"], "UTC", 87.01, 43.01,
+            init_time=init_time, max_lead_hours=0.01,
+        ))
+        self.assertEqual([frame.time_index for frame in frames], [0])
 
     def test_point_frames_keep_missing_values_and_relocate_moving_grid(self):
         self.add_coordinates()

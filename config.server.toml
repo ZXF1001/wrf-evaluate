@@ -17,14 +17,14 @@ temperature_2m = "2m气温"
 [period]
 # 绘图和指标共同使用的起止时刻，包含端点；+08:00 为北京时间，Z 为 UTC。
 start = "2024-12-01T12:00:00+08:00"
-end = "2024-12-03T12:00:00+08:00"
+end = "2024-12-07T12:00:00+08:00"
 
 [matching]
 time_tolerance_seconds = 60  # 瞬时指标最近时刻一对一配对；时段量比较完整相同区间；绘图不重采样
 
 [maps]
 # 空间填色图使用 period 的起止时间，从 start 起每隔该时长输出一组图。
-interval = "6h"
+interval = "12h"
 
 [metrics]
 # 雨量 >= 阈值即事件，单位 mm。填写业务阈值后使用；空数组表示不计算降水事件率。
@@ -46,12 +46,14 @@ patterns = ["wrfout_d03*"]
 timezone = "UTC"
 # 自动递归查找 root 下的文件；yyyymmddhh 目录名按此 timezone 作为起报时间。
 # 平铺文件回退读取 SIMULATION_START_DATE，缺少时读取 START_DATE；无需逐文件填写。
-min_lead_hours = 0  # 默认 0；例如设为 6，排除 lead time < 6h，6h 端点保留
+min_lead_hours = 6  # 默认 0；例如设为 6，排除 lead time < 6h，6h 端点保留
+max_lead_hours = 168  # 默认 7 天；筛掉过旧起报目录及文件内超出此时效的时次
 # 仅目录和文件属性均不能表示业务起报时，可显式覆盖平铺文件：
 # init_time = "2024-12-23T12:00:00Z"
 
 [sources.wrf.variables]
-# 左侧固定为统一要素英文名；variable 只指定一个 NetCDF 字段。
+# 左侧固定为统一要素英文名；variable 指定一个 NetCDF 字段。
+# wind_speed_10m 默认由 U10/V10 合成；需要改名时使用 components = ["U10", "V10"]。
 # units 省略时使用 NetCDF 的 units 属性；time_kind 默认 instant。
 [sources.wrf.variables.temperature_2m]
 variable = "T2"

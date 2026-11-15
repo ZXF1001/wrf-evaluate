@@ -5,10 +5,22 @@ import unittest
 
 from wrf_evaluate.config import PeriodConfig
 from wrf_evaluate.series import Series, normalize_series
-from wrf_evaluate.variables import VariableConfig, convert_value, parse_variables
+from wrf_evaluate.variables import DEFAULT_VARIABLES, VariableConfig, convert_value, parse_variables
 
 
 class VariableTests(unittest.TestCase):
+    def test_wrf_wind_uses_two_components_and_rejects_single_component(self):
+        spec = DEFAULT_VARIABLES['wrf']['wind_speed_10m']
+        self.assertEqual(spec.native_variables, ('U10', 'V10'))
+        self.assertEqual(spec.time_kind, 'instant')
+        for value in ('U10', 'V10', 'U', 'V'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, '风分量'):
+                parse_variables({'wind_speed_10m': {'variable': value}}, 'wrf')
+        custom = dict(parse_variables({
+            'wind_speed_10m': {'components': ['U10_EARTH', 'V10_EARTH']},
+        }, 'wrf'))['wind_speed_10m']
+        self.assertEqual(custom.native_variables, ('U10_EARTH', 'V10_EARTH'))
+
     def test_mapping_is_one_native_variable_without_implicit_components(self):
         spec = dict(parse_variables({
             'precipitation': {'variable': 'RAINC', 'time_kind': 'cumulative'},

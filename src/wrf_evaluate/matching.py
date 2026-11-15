@@ -130,8 +130,11 @@ def iter_time_matches(sources: Iterable[SourceConfig], tolerance: timedelta) -> 
             header = read_wrf_header(path, source.timezone)
             init_time = forecast_init_time(source, path, header.model_start_time)
             cutoff = valid_from(source, init_time)
+            latest = init_time + timedelta(hours=source.max_lead_hours) if init_time else None
             for time_index, time in enumerate(header.times):
                 if cutoff is not None and time < cutoff:
+                    continue
+                if latest is not None and time > latest:
                     continue
                 frame = WrfFrame(source.name, path, time_index, time, header.model_start_time)
                 utc_time = time.astimezone(timezone.utc)

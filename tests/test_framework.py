@@ -305,15 +305,17 @@ enabled = false
             self.assertEqual((directory / 'config.toml').read_bytes(), original)
         self.assertEqual((first / 'result.csv').read_text(encoding='utf-8'), 'previous result')
 
-    def test_run_name_collision_leaves_existing_directory_untouched(self):
+    def test_run_name_collision_creates_unique_directory_without_overwrite(self):
         config = load_config(self.path)
         with patch('wrf_evaluate.output.datetime') as clock:
             clock.now.return_value.strftime.return_value = '20261115_120000_000001'
             first = create_run_directory(config)
-            with self.assertRaises(FileExistsError):
-                create_run_directory(config)
+            second = create_run_directory(config)
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.name.endswith('_001'))
         self.assertEqual(list(first.iterdir()), [first / 'config.toml'])
         self.assertEqual((first / 'config.toml').read_bytes(), self.path.read_bytes())
+        self.assertEqual((second / 'config.toml').read_bytes(), self.path.read_bytes())
 
     def test_rejects_invalid_configuration(self):
         cases = [

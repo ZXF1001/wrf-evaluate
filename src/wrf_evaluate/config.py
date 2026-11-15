@@ -36,6 +36,7 @@ class SourceConfig:
     variable_mapping: tuple[tuple[str, VariableConfig], ...] = ()
     min_lead_hours: float = 0.0
     init_time: datetime | None = None
+    max_lead_hours: float = 168.0
 
     def variable(self, field: str) -> VariableConfig | None:
         """未接入的要素没有隐式默认变量。"""
@@ -243,19 +244,27 @@ def load_config(path: str | Path) -> Config:
     parsed = []
     for name, value in sources.items():
         field = f"sources.{name}"
-        source = _table(value, {"kind", "root", "patterns", "files", "timezone", "enabled", "variables", "min_lead_hours", "init_time"}, field)
+        source = _table(value, {"kind", "root", "patterns", "files", "timezone", "enabled", "variables", "min_lead_hours", "init_time", "max_lead_hours"}, field)
         kind = _text(source.get("kind"), f"{field}.kind")
         if kind not in {"wrf", "cldas", "regional", "national", "ec"}:
             raise ConfigError(f"{field}.kind: 不支持的数据类型 {kind}")
+        max_lead_hours = source.get("max_lead_hours", 168)
+        if "max_lead_hours" in source and kind != "wrf":
+            raise ConfigError(f"{field}.max_lead_hours: 当前仅 WRF 来源使用")
+        if type(max_lead_hours) not in (int, float) or not math.isfinite(max_lead_hours) or max_lead_hours <= 0:
+            raise ConfigError(f"{field}.max_lead_hours: 应为正的有限数值，单位小时")
         min_lead_hours = source.get("min_lead_hours", 0)
         if "min_lead_hours" in source and kind != "wrf":
             raise ConfigError(f"{field}.min_lead_hours: 当前仅 WRF 来源使用")
         if type(min_lead_hours) not in (int, float) or not math.isfinite(min_lead_hours) or min_lead_hours < 0:
             raise ConfigError(f"{field}.min_lead_hours: 应为非负有限数值，单位小时")
+        if min_lead_hours > max_lead_hours:
+            raise ConfigError(f"{field}.min_lead_hours: 不能超过 max_lead_hours")
         try:
             timedelta(hours=min_lead_hours)
+            timedelta(hours=max_lead_hours)
         except OverflowError as exc:
-            raise ConfigError(f"{field}.min_lead_hours: 数值过大") from exc
+            raise ConfigError(f"{field}: 预报时效数值过大") from exc
         init_time = source.get("init_time")
         if "init_time" in source:
             if kind != "wrf":
@@ -350,7 +359,8 @@ def load_config(path: str | Path) -> Config:
                 raise ConfigError(f"{field}.root: 目录不存在或无法访问: {root}")
             if output_dir.is_relative_to(root) or root.is_relative_to(output_dir):
                 raise ConfigError(f"output.directory: 不得与数据源目录重叠: {root}")
-        parsed.append(SourceConfig(name, kind, root, patterns, timezone, enabled, files, variable_mapping, float(min_lead_hours), init_time))
+        parsed.append(SourceConfig(name, kind, root, patterns, timezone, enabled, files, variable_mapping,
+                                   float(min_lead_hours), init_time, float(max_lead_hours)))
 
     if not any(source.enabled for source in parsed):
         raise ConfigError("sources: 至少启用一个数据源")

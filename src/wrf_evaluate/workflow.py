@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 import re
 from time import monotonic
@@ -12,7 +12,7 @@ from .catalog import iter_source_files
 from .cldas import read_cldas_points
 from .config import Config, ConfigError, PointConfig, SourceConfig
 from .evaluation import Comparison, compare_forecast, write_metrics
-from .forecasts import eligible_series, forecast_init_time, select_latest, valid_from
+from .forecasts import eligible_series, forecast_init_time, iter_wrf_files, select_latest, valid_from
 from .matching import index_cldas_files
 from .maps import plot_maps
 from .output import create_run_directory
@@ -20,7 +20,7 @@ from .plotting import plot_series
 from .series import Series, normalize_series
 from .station import iter_regional_observations
 from .variables import convert_value, validate_variable
-from .wrf import iter_wrf_points_frames
+from .wrf import iter_wrf_points_frames, resolve_wrf_variable
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,7 @@ def _regional_series(
         fields = _fields(source, config)
         if source.kind != "regional" or not fields:
             continue
+        specs = {field: source.variable(field) for field in fields}
         records = {(station_id, field): [] for station_id in station_ids for field in fields}
         count = 0
         last_report = monotonic() - 5
@@ -105,7 +106,7 @@ def _regional_series(
             )) as rows:
                 for row in rows:
                     for field in fields:
-                        spec = source.variable(field)
+                        spec = specs[field]
                         records[row.station_id, field].append(
                             (row.time, row.values[field], spec.units, f"{path} 第 {row.row} 行")
                         )
@@ -118,7 +119,7 @@ def _regional_series(
                 )
             label = _label(source, field, station_id=station_id)
             result.setdefault((station_id, field), []).append(
-                normalize_series(label, field, source.variable(field), rows, config.period)
+                normalize_series(label, field, specs[field], rows, config.period)
             )
     return result
 
@@ -148,7 +149,10 @@ def _wrf_series(
 ) -> dict:
     fields = _fields(source, config)
     run_records = {}
-    names = tuple(dict.fromkeys(source.variable(field).variable for field in fields))
+    specs = {field: source.variable(field) for field in fields}
+    cumulative = any(spec.time_kind == "cumulative" for spec in specs.values())
+    run_locations = {}
+    names = tuple(dict.fromkeys(name for spec in specs.values() for name in spec.native_variables))
     if not names:
         return {}
     frames_read = 0
@@ -157,16 +161,17 @@ def _wrf_series(
     last_report = monotonic() - 5
     reported_starts = set()
     _notify(progress, f"读取 WRF 来源 {source.name}：一次提取 {len(coordinates)} 个点位…")
-    for path in iter_source_files(source):
+    for path in iter_wrf_files(source, config.period, progress):
         files_read += 1
         now = monotonic()
         if files_read == 1 or now - last_report >= 5:
-            _notify(progress, f"{source.name}：检查文件 {files_read:,}，已取 {frames_read:,} 个时次；当前 {path.name}")
+            _notify(progress, f"{source.name}：打开候选文件 {files_read:,}，已取 {frames_read:,} 个时次；当前 {path.name}")
             last_report = now
         directory_start = forecast_init_time(source, path, require=False)
         with closing(iter_wrf_points_frames(
             path, names, source.timezone, coordinates, period=config.period,
             init_time=directory_start, min_lead_hours=source.min_lead_hours,
+            max_lead_hours=source.max_lead_hours,
         )) as frames:
             start = None
             for batch in frames:
@@ -195,12 +200,17 @@ def _wrf_series(
                     _notify(progress, f"读取 WRF 时次：已处理 {frames_read:,} 个")
                     last_report = now
                 for point, frame in zip(config.points, batch, strict=True):
+                    if cumulative:
+                        location = frame.row, frame.column, frame.grid_coordinates
+                        key = start, point.name
+                        if run_locations.setdefault(key, location) != location:
+                            raise ValueError(f"{path}: 点位 {point.name} 的 WRF 取值网格发生移动，不能对不同格点的累计量差分")
                     for field in fields:
-                        name = source.variable(field).variable
+                        value, units = resolve_wrf_variable(specs[field], frame.values, frame.units)
                         run_records[start][point.name, field].append(
-                            (frame.time, frame.values[name], frame.units[name], f"{path} Time[{frame.time_index}]")
+                            (frame.time, value, units, f"{path} Time[{frame.time_index}]")
                         )
-    _notify(progress, f"{source.name} 取值完成：检查 {files_read:,} 个文件，时段内 {frames_read:,} 个时次")
+    _notify(progress, f"{source.name} 取值完成：打开 {files_read:,} 个候选文件，时段内 {frames_read:,} 个时次")
     if not run_records:
         raise ValueError(f"sources.{source.name}: 配置时段内没有满足 min_lead_hours 的 WRF 时次")
     result = {}
@@ -213,7 +223,8 @@ def _wrf_series(
                         _label(source, field), field, source.variable(field), records[point.name, field],
                         config.period, allow_empty=True,
                     )
-                    curve = eligible_series(curve, valid_from(source, start))
+                    latest = start + timedelta(hours=source.max_lead_hours) if start is not None else None
+                    curve = eligible_series(curve, valid_from(source, start), latest)
                 except ValueError as exc:
                     raise ValueError(f"点位 {point.name}: {exc}") from exc
                 if curve is not None:
