@@ -1,0 +1,115 @@
+# root 和输出目录的相对路径以本配置文件所在目录为基准；files 相对于来源 root。
+# 部署 Linux 时，将 F:/... 替换为服务器上的实际路径。
+# 本阶段 check/scan 均只读，不创建输出目录、不读取数据内容。
+
+# 本次输出的统一要素名；增加要素时，请同时配置其 WRF 和实况映射。
+elements = ["temperature_2m"]
+
+[output]
+directory = "output"  # 可省略，默认 output；每次运行创建独立的 name_运行时间 子目录
+name = "wrf检验"  # 可省略，默认 evaluate
+timezone = "Asia/Shanghai"  # 可省略，默认北京时间；不影响来源数据的时间解释
+
+[display_names]
+# 程序要素 -> 图中显示名称；可整表省略，也可仅覆盖需要改名的项。
+temperature_2m = "2m气温"
+
+[period]
+# 绘图和指标共同使用的起止时刻，包含端点；+08:00 为北京时间，Z 为 UTC。
+start = "2024-12-24T06:00:00+08:00"
+end = "2024-12-24T14:00:00+08:00"
+
+[matching]
+time_tolerance_seconds = 60  # 瞬时指标最近时刻一对一配对；时段量比较完整相同区间；绘图不重采样
+
+[metrics]
+# 雨量 >= 阈值即事件，单位 mm。填写业务阈值后使用；空数组表示不计算降水事件率。
+# 仅比较同一起止时段的雨量；不将不同时长的事件混合统计。
+precipitation_thresholds_mm = []
+
+# 点位由你直接填写，程序不读取位置 Excel；复制此块即可添加点位。
+# 名称不可重复；经纬度使用十进制度。下面保留一个已核对的样例点。
+[[points]]
+name = "水西沟"
+longitude = 87.4897
+latitude = 43.4733
+station_id = "Y5012"  # 仅与站点实测 Excel 对比时使用；点位名称可自行命名
+
+[sources.wrf]
+kind = "wrf"
+root = "F:/Data/example/WRF"
+patterns = ["wrfout_d03*"]
+timezone = "UTC"
+
+[sources.wrf.variables]
+# 左侧固定为统一要素英文名；variable 只指定一个 NetCDF 字段。
+# units 省略时使用 NetCDF 的 units 属性；time_kind 默认 instant。
+[sources.wrf.variables.temperature_2m]
+variable = "T2"
+
+# 若需要降水，将 precipitation 加入文件顶部 elements，并取消以下注释。
+# 指定哪个变量就只读哪个变量，不自动将分量求和。
+# [sources.wrf.variables.precipitation]
+# variable = "RAINNC"
+# time_kind = "cumulative"
+
+[sources.cldas]
+kind = "cldas"
+root = "F:/Data/example/CLDAS-V2-HOR-NRT"
+patterns = ["*.nc"]
+timezone = "UTC"
+
+[sources.cldas.variables]
+# product 是文件名中的 CLDAS 产品代码，variable 是文件内部的场名。
+[sources.cldas.variables.temperature_2m]
+product = "TMP"
+variable = "TAIR"
+
+# [sources.cldas.variables.precipitation]
+# product = "PRE"
+# variable = "PRCP"
+# time_kind = "sum"
+# interval = "1h"
+# timestamp = "end"
+# units 省略时使用文件属性；样例 PRCP 为 mm/h，乘以明确配置的时长后变成 mm。
+
+[sources.regional]
+kind = "regional"
+root = "F:/Data/区域站数据"
+# 只读取你明确列出的 Excel，不遍历目录、不按站号猜文件名。
+# 在 root 下填写完整的相对路径，例如 files = ["2024/excel/实际文件名.xlsx"]。
+files = ["2024/excel/Y5012_乌鲁木齐县水西沟镇气象观测站_10.8_16.8.xls"]
+timezone = "UTC"  # 跨年样例推断，尚不代表所有文件均已核验
+
+[sources.regional.variables]
+# variable 是 Excel 表头；Excel 没有单位元数据，必须填写 units。
+[sources.regional.variables.station_id]
+variable = "区站号"
+[sources.regional.variables.time]
+variable = "观测时间"
+[sources.regional.variables.temperature_2m]
+variable = "气温(°)"
+units = "degC"
+time_kind = "instant"
+[sources.regional.variables.relative_humidity_2m]
+variable = "相对湿度(%RH)"
+units = "%"
+time_kind = "instant"
+[sources.regional.variables.wind_speed_10m]
+variable = "10min平均风速(m/s)"
+units = "m/s"
+time_kind = "mean"
+interval = "10min"
+timestamp = "end"
+
+# 降水需先核实 Excel 列的业务含义，再取消注释并明确配置：
+# 若仅先检验 WRF/CLDAS 降水，区域站可设 enabled = false，避免使用未确认语义。
+# [sources.regional.variables.precipitation]
+# variable = "小时降水量(mm)"
+# units = "mm"
+# time_kind = "sum"       # 已是单个时段雨量；连续累计读数用 cumulative，逐小时清零另需处理
+# interval = "1h"         # sum 必填：该值代表的时段长度
+# timestamp = "end"       # sum 必填：时间戳是该时段起点还是终点
+
+# 未来可加入 EC 或更多 WRF 试验；名称自定，kind 表示数据类型。
+# 暂不使用的来源可设置 enabled = false，此时不检查其目录。
