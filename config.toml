@@ -3,7 +3,7 @@
 # 本阶段 check/scan 均只读，不创建输出目录、不读取数据内容。
 
 # 本次输出的统一要素名；增加要素时，请同时配置其 WRF 和实况映射。
-elements = ["temperature_2m"]
+elements = ["temperature_2m", "relative_humidity_2m"]
 
 [output]
 directory = "output"  # 可省略，默认 output；每次运行创建独立的 name_运行时间 子目录
@@ -58,6 +58,13 @@ max_lead_hours = 168  # 默认 7 天；筛掉过旧起报目录及文件内超�
 [sources.wrf.variables.temperature_2m]
 variable = "T2"
 
+# 派生湿度：同刻水汽混合比、2m温度和地面气压；单位默认从文件读取。
+# 使用液态水基准，计算结果限制在 0–100%。这组 inputs 可整表省略以使用默认字段。
+[sources.wrf.variables.relative_humidity_2m.inputs]
+mixing_ratio = { variable = "Q2" }
+temperature = { variable = "T2" }
+pressure = { variable = "PSFC" }
+
 # 若需要降水，将 precipitation 加入文件顶部 elements，并取消以下注释。
 # 指定哪个变量就只读哪个变量，不自动将分量求和。
 # [sources.wrf.variables.precipitation]
@@ -75,6 +82,13 @@ timezone = "UTC"
 [sources.cldas.variables.temperature_2m]
 product = "TMP"
 variable = "TAIR"
+
+# CLDAS 是比湿（specific_humidity），不是 WRF Q2 的混合比（mixing_ratio）。
+# 同一产品系列、同一有效时间组合；单个输入可用 units 覆盖文件单位。
+[sources.cldas.variables.relative_humidity_2m.inputs]
+specific_humidity = { variable = "QAIR", product = "SHU" }
+temperature = { variable = "TAIR", product = "TMP" }
+pressure = { variable = "PAIR", product = "PRS" }
 
 # [sources.cldas.variables.precipitation]
 # product = "PRE"

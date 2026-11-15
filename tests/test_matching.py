@@ -11,7 +11,8 @@ from unittest.mock import patch
 from wrf_evaluate.cldas import CldasReadError, parse_cldas_filename
 from wrf_evaluate.cli import main
 from wrf_evaluate.config import Config, PeriodConfig, SourceConfig
-from wrf_evaluate.matching import TimeMatchError, index_cldas_files, iter_time_matches
+from wrf_evaluate.matching import TimeMatchError, index_cldas_files, iter_time_matches, iter_cldas_input_files
+from wrf_evaluate.variables import DEFAULT_VARIABLES
 from wrf_evaluate.wrf import WrfHeader
 
 
@@ -34,8 +35,22 @@ class TimeMatchingTests(unittest.TestCase):
     def cldas_path(self, production='20241226000900', valid='2024122400', product='TMP', family='NRT_ASI_0P0625'):
         return Path(f'cldas/Z_NAFP_C_BABJ_{production}_P_CLDAS_{family}_HOR-{product}-{valid}.nc')
 
-    def matches(self, seconds=60, sources=None):
-        return list(iter_time_matches(sources or (self.wrf, self.cldas), timedelta(seconds=seconds)))
+    def matches(self, seconds=60, sources=None, period=None):
+        return list(iter_time_matches(sources or (self.wrf, self.cldas), timedelta(seconds=seconds), period=period))
+
+    def test_humidity_inputs_use_same_family_time_and_latest_versions(self):
+        old = self.cldas_path(product='SHU', production='20241225000900')
+        latest = self.cldas_path(product='SHU')
+        self.files['analysis'] = [old, latest, self.cldas_path(),
+                                  self.cldas_path(product='PRS', valid='2024122401'),
+                                  self.cldas_path(product='PRS', family='NRT_CHN_0P0625')]
+        rows = list(iter_cldas_input_files('analysis', DEFAULT_VARIABLES['cldas']['relative_humidity_2m'],
+                                          index_cldas_files([self.cldas])))
+        self.assertEqual(len(rows), 1)
+        family, time, inputs = rows[0]
+        self.assertEqual(inputs['specific_humidity'].path, latest)
+        self.assertEqual(inputs['temperature'].path, self.cldas_path())
+        self.assertIsNone(inputs['pressure'])  # Neither a different hour nor a different grid family can fill it.
 
     def test_tolerance_is_inclusive_and_keeps_unmatched_frames(self):
         offsets = (-61, -60, 0, 60, 61)
@@ -128,11 +143,52 @@ class TimeMatchingTests(unittest.TestCase):
             with self.subTest(kind=empty.kind), self.assertRaisesRegex(TimeMatchError, 'empty_trial'):
                 self.matches(sources=(self.wrf, self.cldas, empty))
 
+    def test_period_filters_paths_then_actual_frames_with_progress(self):
+        period = PeriodConfig(self.time, self.time + timedelta(minutes=10))
+        times = tuple(self.time + timedelta(minutes=m) for m in (-10, 0, 5, 10, 20))
+        self.headers[self.forecast] = replace(self.headers[self.forecast], times=times)
+        self.files['analysis'].append(self.cldas_path(valid='2024122401'))
+        messages = []
+        with patch('wrf_evaluate.matching.iter_wrf_files', return_value=iter([self.forecast])) as paths:
+            matches = list(iter_time_matches((self.wrf, self.cldas), timedelta(minutes=1),
+                                            period=period, progress=messages.append))
+        paths.assert_called_once_with(self.wrf, period, messages.append)
+        self.assertEqual([m.forecast.time_index for m in matches], [1, 2, 3])
+        self.assertEqual([m.observation is not None for m in matches], [True, False, False])
+        self.assertTrue(any('打开候选文件 1' in message for message in messages))
+        self.assertTrue(any('3 个有效时刻' in message for message in messages))
+
+    def test_period_excludes_observations_outside_range_even_with_tolerance(self):
+        boundary = self.time + timedelta(minutes=1)
+        self.headers[self.forecast] = replace(self.headers[self.forecast], times=(boundary,))
+        self.files['analysis'] = [self.cldas_path(valid='2024122400')]
+        period = PeriodConfig(boundary, boundary + timedelta(minutes=1))
+        with self.assertRaisesRegex(TimeMatchError, '时段内没有 CLDAS'):
+            self.matches(60, period=period)
+
+    def test_empty_period_reports_candidates_and_contents_separately(self):
+        period = PeriodConfig(self.time, self.time + timedelta(minutes=10))
+        for paths, message in (([], '相交的 WRF 候选文件'), ([self.forecast], '文件内没有')):
+            self.headers[self.forecast] = replace(self.headers[self.forecast],
+                                                  times=(self.time - timedelta(hours=1),))
+            with self.subTest(paths=paths), \
+                 patch('wrf_evaluate.matching.iter_wrf_files', return_value=iter(paths)), \
+                 self.assertRaisesRegex(TimeMatchError, message):
+                list(iter_time_matches((self.wrf, self.cldas), timedelta(0), period=period))
+        self.files['analysis'] = [self.cldas_path(valid='2024122401')]
+        with self.assertRaisesRegex(TimeMatchError, '时段内没有 CLDAS'):
+            list(iter_time_matches((self.wrf, self.cldas), timedelta(0), period=period))
+
     def test_cli_match_reports_counts_without_opening_cldas_or_writing_files(self):
-        config = Config((self.wrf, self.cldas), Path('output'), 'UTC', timedelta(seconds=60))
+        period = PeriodConfig(self.time, self.time + timedelta(minutes=10))
+        config = Config((self.wrf, self.cldas), Path('output'), 'UTC', timedelta(seconds=60), period=period)
         output = StringIO()
-        with patch('wrf_evaluate.cli.load_config', return_value=config), redirect_stdout(output):
+        with patch('wrf_evaluate.cli.load_config', return_value=config), \
+             patch('wrf_evaluate.matching.iter_wrf_files', return_value=iter([self.forecast])) as paths, \
+             redirect_stdout(output):
             self.assertEqual(main(['match']), 0)
+        self.assertEqual(paths.call_args.args[:2], (self.wrf, period))
+        self.assertRegex(output.getvalue(), r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]')
         self.assertIn('配对 1，未配对 0', output.getvalue())
         self.assertIn('最大绝对时差 0 秒', output.getvalue())
 

@@ -13,8 +13,8 @@ from matplotlib.figure import Figure
 from wrf_evaluate.config import ConfigError, load_config
 from wrf_evaluate.cldas import CldasFileInfo, CldasField, CldasHeader
 from wrf_evaluate.config import Config, PeriodConfig, SourceConfig
-from wrf_evaluate.maps import _converted, _draw, _forecast_field, _latest_field, _window, plot_maps
-from wrf_evaluate.variables import VariableConfig
+from wrf_evaluate.maps import _converted, _draw, _forecast_field, _latest_field, _observation_field, _window, plot_maps
+from wrf_evaluate.variables import DEFAULT_VARIABLES, VariableConfig
 from wrf_evaluate.wrf import WrfField
 
 
@@ -33,6 +33,72 @@ class MapTests(unittest.TestCase):
                 'XLAT': WrfField(np.ma.asarray(self.lat), 'degrees'),
             }
         return patch('wrf_evaluate.maps.read_wrf_fields', side_effect=fields)
+
+    def test_wrf_humidity_map_uses_same_derived_field_and_mask(self):
+        ratio = 0.622 * 305.6 / (90000 - 305.6)
+        fields = {
+            'T2': WrfField(np.ma.ones((2, 2)) * 273.15, 'K'),
+            'PSFC': WrfField(np.ma.ones((2, 2)) * 90000, 'Pa'),
+            'Q2': WrfField(np.ma.array([[ratio, .01], [ratio, 0]], mask=[[0, 0], [1, 0]]), 'kg/kg'),
+            'XLONG': WrfField(np.ma.asarray(self.lon), 'degrees'),
+            'XLAT': WrfField(np.ma.asarray(self.lat), 'degrees'),
+        }
+        with patch('wrf_evaluate.maps.read_wrf_fields', return_value=fields) as read:
+            _, _, result = _forecast_field(self.frames, 'relative_humidity_2m',
+                                          DEFAULT_VARIABLES['wrf']['relative_humidity_2m'],
+                                          self.start, self.start)
+        self.assertEqual(set(read.call_args.args[1]), set(fields))
+        self.assertAlmostEqual(result[0, 0], 50)
+        self.assertEqual(result[0, 1], 100)
+        self.assertTrue(result.mask[1, 0])
+        self.assertEqual(result[1, 1], 0)
+
+    def test_cldas_humidity_crop_and_grid_validation(self):
+        spec = DEFAULT_VARIABLES['cldas']['relative_humidity_2m']
+        files = {role: CldasFileInfo(Path(item.product), item.product, self.start, self.start, 'family')
+                 for role, item in spec.inputs}
+        header = CldasHeader(Path('SHU'), 'SHU', self.start, self.lat[:, 0], self.lon[0], frozenset())
+        ratio = 0.622 * 305.6 / (90000 - 305.6)
+        fields = {'QAIR': CldasField(np.ma.ones((2, 2)) * ratio / (1 + ratio), 'kg/kg'),
+                  'TAIR': CldasField(np.ma.ones((2, 2)) * 273.15, 'K'),
+                  'PAIR': CldasField(np.ma.ones((2, 2)) * 90000, 'Pa')}
+        selection = (slice(0, 2), slice(0, 2))
+        with patch('wrf_evaluate.maps.read_cldas_header', return_value=header), \
+             patch('wrf_evaluate.maps.read_cldas_field', side_effect=lambda path, name, **kw: fields[name]) as read:
+            result = _observation_field(files, spec, 'relative_humidity_2m', header, selection, 'UTC')
+        np.testing.assert_allclose(result, 50)
+        self.assertEqual(read.call_count, 3)
+        self.assertTrue(all(call.kwargs['selection'] == selection for call in read.call_args_list))
+        with patch('wrf_evaluate.maps.read_cldas_header', return_value=replace(header, longitudes=self.lon[0] + .01)), \
+             patch('wrf_evaluate.maps.read_cldas_field', return_value=fields['QAIR']):
+            with self.assertRaisesRegex(ValueError, '网格不一致'):
+                _observation_field(files, spec, 'relative_humidity_2m', header, selection, 'UTC')
+
+    def test_humidity_map_schedule_combines_three_products_once(self):
+        wrf = SourceConfig('wrf', 'wrf', Path('wrf'), ('*',), 'UTC', True)
+        cldas = SourceConfig('cldas', 'cldas', Path('cldas'), ('*',), 'UTC', True)
+        config = Config((wrf, cldas), Path('output'), 'UTC', timedelta(minutes=1),
+                        period=PeriodConfig(self.start, self.start + timedelta(hours=6)),
+                        elements=('relative_humidity_2m',))
+        index = {}
+        for product in ('SHU', 'TMP', 'PRS'):
+            times = (config.period.start, config.period.end)
+            files = tuple(CldasFileInfo(Path(f'{product}_{i}'), product, t, t, 'family')
+                          for i, t in enumerate(times))
+            index['cldas', 'family', product] = times, files
+        # Pressure exists only at the first scheduled time.
+        index['cldas', 'family', 'PRS'] = ((self.start,), index['cldas', 'family', 'PRS'][1][:1])
+        header = CldasHeader(Path('SHU_0'), 'SHU', self.start, self.lat[:, 0], self.lon[0], frozenset())
+        grid = self.lon, self.lat, np.ma.ones((2, 2)) * 50
+        messages = []
+        with patch('wrf_evaluate.maps.read_cldas_header', return_value=header), \
+             patch('wrf_evaluate.maps._observation_field', return_value=grid[2]) as observe, \
+             patch('wrf_evaluate.maps._latest_field', return_value=(None, grid)), \
+             patch('wrf_evaluate.maps._draw') as draw:
+            plot_maps(config, [wrf, cldas], index, {'wrf': {}}, Path('output'), messages.append)
+        self.assertEqual(draw.call_count, 1)
+        self.assertEqual(set(observe.call_args.args[0]), {'specific_humidity', 'temperature', 'pressure'})
+        self.assertTrue(any('缺少同一系列、同刻' in message for message in messages))
 
     def test_cumulative_rain_sums_native_increments_and_keeps_missing(self):
         spec = VariableConfig('RAINNC', time_kind='cumulative')
@@ -79,6 +145,11 @@ class MapTests(unittest.TestCase):
         rain = VariableConfig('PRCP', 'mm/h', 'sum', timedelta(hours=2), 'end')
         np.testing.assert_allclose(_converted('precipitation', np.ma.array([2]), 'mm/h', rain), [4])
         self.assertEqual(_window(self.start, rain), (self.start - timedelta(hours=2), self.start))
+
+    def test_direct_humidity_map_values_are_bounded(self):
+        values = _converted('relative_humidity_2m', np.ma.array([[-5., 50., 120.]]), '%',
+                            VariableConfig('RH', '%'))
+        np.testing.assert_array_equal(values, [[0., 50., 100.]])
 
     def test_map_selects_latest_run_covering_entire_eligible_window(self):
         old, new = self.start - timedelta(hours=6), self.start

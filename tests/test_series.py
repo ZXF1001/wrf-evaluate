@@ -3,12 +3,68 @@
 from datetime import datetime, timedelta, timezone
 import unittest
 
+import numpy as np
+
 from wrf_evaluate.config import PeriodConfig
 from wrf_evaluate.series import Series, normalize_series
-from wrf_evaluate.variables import DEFAULT_VARIABLES, VariableConfig, convert_value, parse_variables
+from wrf_evaluate.variables import DEFAULT_VARIABLES, VariableConfig, convert_value, parse_variables, relative_humidity
 
 
 class VariableTests(unittest.TestCase):
+    def test_humidity_inputs_are_explicit_and_direct_mapping_overrides_defaults(self):
+        spec = dict(parse_variables({'relative_humidity_2m': {'inputs': {
+            'pressure': {'variable': 'P', 'product': 'PRS', 'units': 'hPa'},
+            'specific_humidity': {'variable': 'Q', 'product': 'SHU', 'units': 'g/kg'},
+            'temperature': {'variable': 'T', 'product': 'TMP', 'units': 'degC'},
+        }}}, 'cldas'))['relative_humidity_2m']
+        self.assertEqual(spec.source_inputs[0][0], 'specific_humidity')
+        self.assertEqual(set(spec.native_variables), {'P', 'Q', 'T'})
+        direct = dict(parse_variables({'relative_humidity_2m': {
+            'variable': 'RH', 'product': 'RHU', 'units': '%',
+        }}, 'cldas'))['relative_humidity_2m']
+        self.assertFalse(direct.inputs)
+        self.assertEqual(direct.source_inputs[0][1].variable, 'RH')
+        for changes in (
+            {'inputs': {'temperature': {'variable': 'T2'}}},
+            {'time_kind': 'mean', 'interval': '1h', 'timestamp': 'end'},
+            {'units': 'kg/kg'},
+            {'inputs': {'temperature': {'variable': 'T', 'units': 'bad'},
+                        'pressure': {'variable': 'P'}, 'mixing_ratio': {'variable': 'Q'}}},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                parse_variables({'relative_humidity_2m': changes}, 'wrf')
+
+    def test_humidity_specific_and_mixing_ratio_agree_for_known_vapor_pressure(self):
+        # At 0 C, saturation vapor pressure is 611.2 Pa; use half of it.
+        pressure, vapor = 90000.0, 305.6
+        ratio = 0.622 * vapor / (pressure - vapor)
+        specific = ratio / (1 + ratio)
+        wrf = DEFAULT_VARIABLES['wrf']['relative_humidity_2m']
+        cldas = DEFAULT_VARIABLES['cldas']['relative_humidity_2m']
+        a = relative_humidity({'temperature': 273.15, 'pressure': pressure, 'mixing_ratio': ratio},
+                              {'temperature': 'K', 'pressure': 'Pa', 'mixing_ratio': 'kg kg-1'}, wrf)
+        b = relative_humidity({'temperature': 0, 'pressure': 900, 'specific_humidity': specific * 1000},
+                              {'temperature': 'degC', 'pressure': 'hPa', 'specific_humidity': 'g/kg'}, cldas)
+        self.assertAlmostEqual(a, 50)
+        self.assertAlmostEqual(b, 50)
+
+    def test_humidity_preserves_masks_and_limits_result_to_zero_to_hundred(self):
+        spec = DEFAULT_VARIABLES['wrf']['relative_humidity_2m']
+        units = {'temperature': 'K', 'pressure': 'Pa', 'mixing_ratio': 'kg/kg'}
+        values = {'temperature': 273.15, 'pressure': 90000, 'mixing_ratio': 0.01}
+        self.assertEqual(relative_humidity(values, units, spec), 100)
+        self.assertEqual(relative_humidity(values | {'mixing_ratio': 0}, units, spec), 0)
+        self.assertIsNone(relative_humidity(values | {'mixing_ratio': None}, units, spec))
+        result = relative_humidity(values | {
+            'temperature': np.ma.array([273.15, 273.15, np.nan], mask=[0, 1, 0]),
+        }, units, spec)
+        self.assertEqual(result.mask.tolist(), [False, True, True])
+        for changes in ({'pressure': 0}, {'mixing_ratio': -0.001}, {'temperature': 0}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                relative_humidity(values | changes, units, spec)
+        self.assertEqual(convert_value('relative_humidity_2m', 120, '%', 'instant'), 100)
+        self.assertEqual(convert_value('relative_humidity_2m', -5, '%', 'instant'), 0)
+
     def test_wrf_wind_uses_two_components_and_rejects_single_component(self):
         spec = DEFAULT_VARIABLES['wrf']['wind_speed_10m']
         self.assertEqual(spec.native_variables, ('U10', 'V10'))

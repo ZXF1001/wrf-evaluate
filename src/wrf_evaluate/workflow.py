@@ -13,13 +13,13 @@ from .cldas import read_cldas_points
 from .config import Config, ConfigError, PointConfig, SourceConfig
 from .evaluation import Comparison, compare_forecast, write_metrics
 from .forecasts import eligible_series, forecast_init_time, iter_wrf_files, select_latest, valid_from
-from .matching import index_cldas_files
+from .matching import index_cldas_files, iter_cldas_input_files
 from .maps import plot_maps
 from .output import create_run_directory
 from .plotting import plot_series
 from .series import Series, normalize_series
 from .station import iter_regional_observations
-from .variables import convert_value, validate_variable
+from .variables import convert_value, relative_humidity, validate_variable
 from .wrf import iter_wrf_points_frames, resolve_wrf_variable
 
 
@@ -53,7 +53,7 @@ def _validate_sources(config: Config) -> list[SourceConfig]:
                     convert_value(field, None, spec.units, spec.time_kind, spec.interval)
                 if source.kind == "regional" and spec.units is None:
                     raise ValueError("Excel 须填写 units")
-                if source.kind == "cldas" and spec.product is None:
+                if source.kind == "cldas" and any(item.product is None for _, item in spec.source_inputs):
                     raise ValueError("CLDAS 须填写文件名产品代码 product")
             except ValueError as exc:
                 raise ConfigError(f"sources.{source.name}.variables.{field}: {exc}") from exc
@@ -242,46 +242,66 @@ def _cldas_series(
     cldas: list[SourceConfig], index: dict, config: Config,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
-    """每个产品文件只打开一次，提取全部点位及所需变量。"""
-    cldas_curves = {}
-    point_coordinates = tuple((point.longitude, point.latitude) for point in config.points)
+    """每个文件只打开一次；直接字段与派生湿度共用点位样本。"""
+    curves = {}
+    coordinates = tuple((point.longitude, point.latitude) for point in config.points)
     for source in cldas:
-        fields = _fields(source, config)
-        groups = {}
-        for field in fields:
+        plans, jobs = [], {}
+        for field in _fields(source, config):
             spec = source.variable(field)
-            for key, (_, files) in index.items():
-                if key[0] == source.name and key[2] == spec.product:
-                    groups.setdefault(key, {"files": files, "fields": []})["fields"].append(field)
-        for (_, family, _), group in sorted(groups.items()):
-            fields = tuple(group["fields"])
-            names = tuple(dict.fromkeys(source.variable(field).variable for field in fields))
-            samples_by_field = {field: [[] for _ in config.points] for field in fields}
-            files = group["files"]
-            last_report = monotonic() - 5
-            _notify(progress, f"读取 CLDAS {source.name}/{family}：{len(files)} 个文件 × {len(config.points)} 个点位")
-            for file_index, info in enumerate(files, start=1):
-                now = monotonic()
-                if file_index == 1 or now - last_report >= 5:
-                    _notify(progress, f"读取 CLDAS：{file_index}/{len(files)} 个文件")
-                    last_report = now
-                samples = read_cldas_points(info.path, names, point_coordinates, source.timezone)
-                for field in fields:
-                    variable = source.variable(field).variable
-                    for point_index, sample in enumerate(samples[variable]):
-                        samples_by_field[field][point_index].append(
-                            (sample.time, sample.value, sample.units, str(info.path))
-                        )
-            for field, point_rows in samples_by_field.items():
-                for point_index, rows in enumerate(point_rows):
-                    label = _label(source, field)
-                    if len(cldas) > 1 or sum(key[2] == source.variable(field).product for key in groups) > 1:
-                        label += f" / {source.name} / {family}"
-                    key = (config.points[point_index].name, field)
-                    cldas_curves.setdefault(key, []).append(
-                        normalize_series(label, field, source.variable(field), rows, config.period)
-                    )
-    return cldas_curves
+            for family, time, files in iter_cldas_input_files(source.name, spec, index):
+                plans.append((field, family, time, files))
+                for role, item in spec.source_inputs:
+                    info = files[role]
+                    if info is not None:
+                        jobs.setdefault(info.path, set()).add(item.variable)
+        samples = {}
+        last_report = monotonic() - 5
+        _notify(progress, f"读取 CLDAS {source.name}：{len(jobs)} 个文件 × {len(coordinates)} 个点位")
+        for number, (path, names) in enumerate(jobs.items(), start=1):
+            now = monotonic()
+            if number == 1 or now - last_report >= 5:
+                _notify(progress, f"读取 CLDAS：{number}/{len(jobs)} 个文件")
+                last_report = now
+            samples[path] = read_cldas_points(path, tuple(sorted(names)), coordinates, source.timezone)
+        records, missing = {}, {}
+        for field, family, time, files in plans:
+            spec = source.variable(field)
+            incomplete = any(info is None for info in files.values())
+            if incomplete:
+                missing[field, family] = missing.get((field, family), 0) + 1
+            for point_index, point in enumerate(config.points):
+                units = "%"
+                location = f"{source.name}/{family} {time.isoformat()}"
+                if incomplete:
+                    value = None
+                else:
+                    selected = {role: samples[files[role].path][item.variable][point_index]
+                                for role, item in spec.source_inputs}
+                    if spec.inputs:
+                        positions = [sample.grid_coordinates for sample in selected.values()]
+                        if any(position is None for position in positions) or len(set(positions)) != 1:
+                            raise ValueError(f"{location}: 湿度基础变量的最近格点经纬度不一致，不能组合")
+                        try:
+                            value = relative_humidity({role: s.value for role, s in selected.items()},
+                                                      {role: s.units for role, s in selected.items()}, spec)
+                        except ValueError as exc:
+                            raise ValueError(f"{location} 点位 {point.name}: {exc}") from exc
+                    else:
+                        sample = selected["value"]
+                        value, units, location = sample.value, sample.units, str(sample.path)
+                records.setdefault((field, family, point.name), []).append((time, value, units, location))
+        for (field, family), count in missing.items():
+            _notify(progress, f"{source.name}/{family} {field}：{count} 个时次缺少同刻基础产品，保留缺测")
+        for (field, family, point_name), rows in records.items():
+            label = _label(source, field)
+            families = {fam for f, fam, _ in records if f == field}
+            if len(cldas) > 1 or len(families) > 1:
+                label += f" / {source.name} / {family}"
+            curves.setdefault((point_name, field), []).append(
+                normalize_series(label, field, source.variable(field), rows, config.period)
+            )
+    return curves
 
 
 def plot_comparisons(
@@ -297,9 +317,9 @@ def plot_comparisons(
     index = index_cldas_files(cldas, period=config.period, progress=progress) if cldas else {}
     for source in cldas:
         for field in _fields(source, config):
-            product = source.variable(field).product
-            if not any(key[0] == source.name and key[2] == product for key in index):
-                raise ValueError(f"sources.{source.name}: 配置时段内没有 CLDAS {product} 产品")
+            for _, item in source.variable(field).source_inputs:
+                if not any(key[0] == source.name and key[2] == item.product for key in index):
+                    raise ValueError(f"sources.{source.name}: 配置时段内没有 CLDAS {item.product} 产品")
     station_curves = _regional_series(sources, config, progress)
     forecasts = {(point.name, field): [] for point in config.points for field in config.elements}
     map_frames = {}

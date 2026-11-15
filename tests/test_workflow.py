@@ -180,6 +180,48 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.read_frames.assert_called_once()
         self.assertEqual(results[1].comparisons[0].metrics.bias, 10)
 
+    def humidity_samples(self, *, missing_pressure=False, moved_grid=False):
+        pressure, vapor = 90000.0, 305.6
+        ratio = 0.622 * vapor / (pressure - vapor)
+        for product in ('SHU', 'PRS'):
+            for hour in (0, 1):
+                if missing_pressure and product == 'PRS' and hour == 1:
+                    continue
+                self.files['cldas'].append(Path(str(self.cldas_path).replace(
+                    'TMP-2024122400', f'{product}-202412240{hour}')))
+        self.frames = [replace(frame, values={'T2': 273.15, 'Q2': ratio, 'PSFC': pressure},
+                               units={'T2': 'K', 'Q2': 'kg/kg', 'PSFC': 'Pa'}) for frame in self.frames]
+        self.files['cldas'].append(Path(str(self.cldas_path).replace('TMP-2024122400', 'TMP-2024122401')))
+
+        def sample(path, names, points, timezone):
+            info = parse_cldas_filename(path)
+            values = {'TAIR': (273.15, 'K'), 'QAIR': (ratio / (1 + ratio), 'kg/kg'), 'PAIR': (pressure, 'Pa')}
+            position = (88.0 if moved_grid and info.product == 'PRS' else 87.5, 43.5)
+            return {name: tuple(CldasPointSample(path, info.time, None, *values[name], position)
+                                for point in points) for name in names}
+        self.read_cldas.side_effect = sample
+        return replace(self.config, sources=(self.wrf, self.cldas),
+                       elements=('temperature_2m', 'relative_humidity_2m'))
+
+    def test_derived_humidity_reuses_temperature_reads_and_reaches_metrics(self):
+        config = self.humidity_samples(missing_pressure=True)
+        messages = []
+        temperature, humidity = plot_comparisons(config, progress=messages.append)
+        self.assertEqual(self.read_cldas.call_count, 5)
+        self.assertEqual(len({call.args[0] for call in self.read_cldas.call_args_list}), 5)
+        self.assertEqual(set(self.read_frames.call_args.args[1]), {'T2', 'Q2', 'PSFC'})
+        self.assertAlmostEqual(humidity.series[0].values[0], 50)
+        self.assertAlmostEqual(humidity.series[1].values[0], 50)
+        self.assertIsNone(humidity.series[1].values[1])
+        self.assertEqual(humidity.comparisons[0].metrics.sample_count, 1)
+        self.assertAlmostEqual(humidity.comparisons[0].metrics.rmse, 0)
+        self.assertTrue(any('缺少同刻基础产品' in message for message in messages))
+
+    def test_derived_humidity_rejects_different_nearest_grid_coordinates(self):
+        with self.assertRaisesRegex(ValueError, '格点经纬度不一致'):
+            list(plot_comparisons(self.humidity_samples(moved_grid=True)))
+        self.draw.assert_not_called()
+
     def test_missing_station_or_wrong_period_is_not_silently_omitted(self):
         for rows in ([], [self.row(-5, 1)], [replace(self.row(0, 1), station_id='wrong')]):
             self.rows = rows

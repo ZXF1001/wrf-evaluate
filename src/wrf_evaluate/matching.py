@@ -10,8 +10,9 @@ from time import monotonic
 from .catalog import iter_source_files
 from .cldas import CldasFileInfo, parse_cldas_filename
 from .config import PeriodConfig, SourceConfig
-from .forecasts import forecast_init_time, run_order, valid_from
+from .forecasts import forecast_init_time, iter_wrf_files, run_order, valid_from
 from .wrf import read_wrf_header
+from .variables import VariableConfig
 
 
 class TimeMatchError(ValueError):
@@ -94,6 +95,21 @@ def index_cldas_files(
     return index
 
 
+def iter_cldas_input_files(source: str, spec: VariableConfig, index: dict) -> Iterator[tuple]:
+    """以主产品原生时刻组合输入，只接受同一 family、严格同一有效时间。"""
+    inputs = spec.source_inputs
+    anchor = inputs[0][1].product
+    for (name, family, product), (times, files) in sorted(index.items()):
+        if name != source or product != anchor:
+            continue
+        products = {
+            item.product: dict(zip(*index.get((source, family, item.product), ((), ()))))
+            for _, item in inputs
+        }
+        for time in times:
+            yield family, time, {role: products[item.product].get(time) for role, item in inputs}
+
+
 def _nearest(times: tuple[datetime, ...], time: datetime, tolerance: timedelta) -> int | None:
     position = bisect_left(times, time)
     candidates = [i for i in (position - 1, position) if 0 <= i < len(times)]
@@ -108,7 +124,10 @@ def _nearest(times: tuple[datetime, ...], time: datetime, tolerance: timedelta) 
     return index
 
 
-def iter_time_matches(sources: Iterable[SourceConfig], tolerance: timedelta) -> Iterator[TimeMatch]:
+def iter_time_matches(
+    sources: Iterable[SourceConfig], tolerance: timedelta,
+    *, period: PeriodConfig | None = None, progress: Callable[[str], None] | None = None,
+) -> Iterator[TimeMatch]:
     """按有效时刻选满足最低时效的最新批次，再查找最近 CLDAS 时间候选。
 
     此处不认定统计样本，也不判定降水窗口；指标另做一对一或完整区间配对。
@@ -120,18 +139,32 @@ def iter_time_matches(sources: Iterable[SourceConfig], tolerance: timedelta) -> 
     cldas_sources = [source for source in enabled if source.kind == "cldas"]
     if not wrf_sources or not cldas_sources:
         raise ValueError("时间配对需要同时启用 WRF 和 CLDAS 数据源")
-    series = sorted(index_cldas_files(cldas_sources).items())
+    series = sorted(index_cldas_files(cldas_sources, period=period, progress=progress).items())
+    for source in cldas_sources:
+        if not any(key[0] == source.name for key, _ in series):
+            raise TimeMatchError(f"sources.{source.name}: 配置时段内没有 CLDAS 有效时次，请检查 period 和来源时区")
     for source in wrf_sources:
-        found = False
+        count = 0
+        last_report = monotonic()
         selected = {}
         seen = {}
-        for path in iter_source_files(source):
-            found = True
+        if progress is not None:
+            progress(f"读取 WRF 来源 {source.name} 的候选文件时间…")
+        paths = (iter_wrf_files(source, period, progress) if period is not None
+                 else iter_source_files(source))
+        for path in paths:
+            count += 1
+            now = monotonic()
+            if progress is not None and (count == 1 or now - last_report >= 5):
+                progress(f"{source.name}：打开候选文件 {count:,}，已取 {len(selected):,} 个有效时刻；当前 {path.name}")
+                last_report = now
             header = read_wrf_header(path, source.timezone)
             init_time = forecast_init_time(source, path, header.model_start_time)
             cutoff = valid_from(source, init_time)
             latest = init_time + timedelta(hours=source.max_lead_hours) if init_time else None
             for time_index, time in enumerate(header.times):
+                if period is not None and not period.start <= time <= period.end:
+                    continue
                 if cutoff is not None and time < cutoff:
                     continue
                 if latest is not None and time > latest:
@@ -145,8 +178,13 @@ def iter_time_matches(sources: Iterable[SourceConfig], tolerance: timedelta) -> 
                 previous = selected.get(utc_time)
                 if previous is None or run_order(init_time) > run_order(previous[0]):
                     selected[utc_time] = init_time, frame
-        if not found:
-            raise TimeMatchError(f"sources.{source.name}: 未找到 WRF 文件，请检查 root 和 patterns")
+        if not count:
+            detail = "未找到与配置时段及预报时效相交的 WRF 候选文件" if period else "未找到 WRF 文件"
+            raise TimeMatchError(f"sources.{source.name}: {detail}，请检查 root、patterns 和时间配置")
+        if not selected:
+            raise TimeMatchError(f"sources.{source.name}: WRF 候选文件内没有满足时段及预报时效的有效时次")
+        if progress is not None:
+            progress(f"{source.name} 时间候选读取完成：{len(selected):,} 个有效时刻")
         for utc_time, (_, frame) in sorted(selected.items()):
             for (name, family, product), (times, files) in series:
                 nearest = _nearest(times, utc_time, tolerance)

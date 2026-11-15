@@ -4,6 +4,8 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 import re
 
+import numpy as np
+
 
 DISPLAY_NAMES = {
     "temperature_2m": "2m气温",
@@ -24,8 +26,17 @@ UNITS = {
 
 
 @dataclass(frozen=True)
+class InputVariable:
+    """派生相对湿度所需的一个原始字段；单位可覆盖文件属性。"""
+
+    variable: str
+    units: str | None = None
+    product: str | None = None
+
+
+@dataclass(frozen=True)
 class VariableConfig:
-    """Native field (or WRF wind components), units and time semantics."""
+    """原始字段、风分量或湿度输入，以及单位和时间含义。"""
 
     variable: str | None
     units: str | None = None
@@ -34,10 +45,21 @@ class VariableConfig:
     timestamp: str | None = None
     product: str | None = None
     components: tuple[str, ...] = ()
+    inputs: tuple[tuple[str, InputVariable], ...] = ()
 
     @property
     def native_variables(self) -> tuple[str, ...]:
+        if self.inputs:
+            return tuple(dict.fromkeys(item.variable for _, item in self.inputs))
         return self.components or ((self.variable,) if self.variable else ())
+
+    @property
+    def source_inputs(self) -> tuple[tuple[str, InputVariable], ...]:
+        """CLDAS 直接字段与派生字段共用产品/变量读取计划。"""
+        if self.inputs:
+            # 以水汽产品作为原生时间轴，不受 TOML 子表书写顺序影响。
+            return tuple(sorted(self.inputs, key=lambda item: item[0] in {"temperature", "pressure"}))
+        return (("value", InputVariable(self.variable, self.units, self.product)),)
 
 
 # Defaults are only for fields verified in the supplied data templates.
@@ -46,9 +68,19 @@ DEFAULT_VARIABLES = {
     "wrf": {
         "temperature_2m": VariableConfig("T2"),
         "wind_speed_10m": VariableConfig(None, components=("U10", "V10")),
+        "relative_humidity_2m": VariableConfig(None, inputs=(
+            ("mixing_ratio", InputVariable("Q2")),
+            ("temperature", InputVariable("T2")),
+            ("pressure", InputVariable("PSFC")),
+        )),
     },
     "cldas": {
         "temperature_2m": VariableConfig("TAIR", product="TMP"),
+        "relative_humidity_2m": VariableConfig(None, inputs=(
+            ("specific_humidity", InputVariable("QAIR", product="SHU")),
+            ("temperature", InputVariable("TAIR", product="TMP")),
+            ("pressure", InputVariable("PAIR", product="PRS")),
+        )),
     },
     "regional": {
         "station_id": VariableConfig("区站号"),
@@ -101,14 +133,21 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
         } | ({"product"} if kind == "cldas" else set())
         if kind == "wrf" and field == "wind_speed_10m":
             allowed_options.add("components")
+        if kind in {"wrf", "cldas"} and field == "relative_humidity_2m":
+            allowed_options.add("inputs")
         if unknown := options.keys() - allowed_options:
             raise ValueError(f"{field}: 未知配置项 {', '.join(sorted(unknown))}")
 
         base = defaults.get(field)
-        if base is None and not {"variable", "components"}.intersection(options):
+        if base is None and not {"variable", "components", "inputs"}.intersection(options):
             raise ValueError(f"{field}.variable: 请指定原始变量名")
         updates = {}
-        if "components" in options:
+        if "inputs" in options:
+            if {"variable", "product", "components"}.intersection(options):
+                raise ValueError(f"{field}: inputs 不能与 variable/product/components 混用")
+            updates.update(inputs=_parse_humidity_inputs(options["inputs"], kind),
+                           variable=None, product=None, components=())
+        elif "components" in options:
             if "variable" in options:
                 raise ValueError(f"{field}: variable 与 components 只能配置一项")
             components = options["components"]
@@ -127,6 +166,7 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
                 raise ValueError(f"{field}.variable: {text} 是风分量，不是风速；请使用 components = [\"U10\", \"V10\"]")
             updates["variable"] = text
             updates["components"] = ()
+            updates["inputs"] = ()
         for key in ("units", "time_kind", "timestamp", "product"):
             if key not in options:
                 continue
@@ -153,7 +193,44 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
     return tuple(result.items())
 
 
+def _parse_humidity_inputs(value: object, kind: str) -> tuple[tuple[str, InputVariable], ...]:
+    if not isinstance(value, dict) or set(value) not in (
+        {"temperature", "pressure", "mixing_ratio"},
+        {"temperature", "pressure", "specific_humidity"},
+    ):
+        raise ValueError("inputs 须有 temperature、pressure，以及 mixing_ratio 或 specific_humidity 二选一")
+    result = []
+    for role, options in value.items():
+        allowed = {"variable", "units"} | ({"product"} if kind == "cldas" else set())
+        if not isinstance(options, dict) or options.keys() - allowed:
+            raise ValueError(f"inputs.{role}: 只接受 {', '.join(sorted(allowed))}")
+        if "variable" not in options or (kind == "cldas" and "product" not in options):
+            raise ValueError(f"inputs.{role}: 须填写 variable；CLDAS 还须填写 product")
+        if any(not isinstance(text, str) or not text.strip() for text in options.values()):
+            raise ValueError(f"inputs.{role}: 字段值须为非空字符串")
+        item = InputVariable(**{key: text.strip() for key, text in options.items()})
+        if item.product is not None and not re.fullmatch(r"[A-Z0-9]+", item.product):
+            raise ValueError(f"inputs.{role}.product: 产品代码须为大写字母或数字")
+        result.append((role, item))
+    return tuple(result)
+
+
 def validate_variable(field: str, spec: VariableConfig) -> None:
+    if spec.inputs:
+        if field != "relative_humidity_2m" or spec.variable or spec.components or spec.product:
+            raise ValueError("inputs 仅用于派生 relative_humidity_2m，不能同时映射直接字段")
+        if spec.time_kind != "instant":
+            raise ValueError("派生相对湿度只接受同一时刻的瞬时输入，不能用平均基础量推算平均湿度")
+        if spec.units not in (None, "%"):
+            raise ValueError("派生相对湿度输出单位固定为 %；原始单位请放在 inputs 对应字段中")
+        if set(dict(spec.inputs)) not in (
+            {"temperature", "pressure", "mixing_ratio"},
+            {"temperature", "pressure", "specific_humidity"},
+        ) or len(spec.inputs) != 3:
+            raise ValueError("相对湿度输入须包含温度、气压及一种明确的水汽量")
+        for role, item in spec.inputs:
+            if item.units is not None:
+                convert_value(role, None, item.units, "instant")
     if spec.time_kind not in {"instant", "mean", "sum", "cumulative"}:
         raise ValueError(
             f"{field}.time_kind: 须明确填写 instant / mean / sum / cumulative"
@@ -176,11 +253,21 @@ def convert_value(
     """Convert supported units into the common comparison units."""
     unit = units.strip().lower().replace(" ", "").replace("²", "2").replace("**", "^")
     scale, offset = 1.0, 0.0
-    if field == "temperature_2m":
+    if field in {"temperature_2m", "temperature"}:
         if unit in {"k", "kelvin"}:
             offset = -273.15
         elif unit not in {"c", "℃", "°c", "degc", "degree_celsius", "degrees_celsius"}:
             raise ValueError(f"无法识别温度单位 {units!r}")
+    elif field == "pressure":
+        if unit in {"hpa", "mb", "mbar"}:
+            scale = 100.0
+        elif unit != "pa":
+            raise ValueError(f"气压单位须为 Pa 或 hPa: {units!r}")
+    elif field in {"mixing_ratio", "specific_humidity"}:
+        if unit in {"g/kg", "gkg-1", "gkg^-1"}:
+            scale = 0.001
+        elif unit not in {"kg/kg", "kgkg-1", "kgkg^-1", "1"}:
+            raise ValueError(f"水汽混合比/比湿单位须为 kg/kg 或 g/kg: {units!r}")
     elif field == "relative_humidity_2m":
         if unit in {"1", "fraction"}:
             scale = 100.0
@@ -209,6 +296,41 @@ def convert_value(
     if value is None:
         return None
     result = value * scale + offset
+    if field == "relative_humidity_2m":
+        result = float(np.clip(result, 0.0, 100.0))
     if field == "precipitation" and result < 0:
         raise ValueError("有效降水量不能为负，请核对缺测码与累计规则")
+    return result
+
+
+def relative_humidity(values: dict, units: dict[str, str], spec: VariableConfig):
+    """液态水基准：Bolton 饱和水汽压；混合比和比湿使用各自的水汽压公式。
+
+    标量和掩码数组共用计算；缺测传播，结果限制在 0–100%。
+    """
+    inputs = dict(spec.inputs)
+    converted = {
+        role: convert_value(role, values[role], item.units or units[role], "instant")
+        for role, item in inputs.items()
+    }
+    if any(value is None for value in converted.values()):
+        return None
+    temperature = np.ma.masked_invalid(np.ma.asarray(converted["temperature"], dtype=np.float64))
+    pressure = np.ma.masked_invalid(np.ma.asarray(converted["pressure"], dtype=np.float64))
+    specific = "specific_humidity" in converted
+    moisture = np.ma.masked_invalid(np.ma.asarray(
+        converted["specific_humidity" if specific else "mixing_ratio"], dtype=np.float64,
+    ))
+    if (np.ma.any(temperature <= -243.5) or np.ma.any(pressure <= 0)
+            or np.ma.any(moisture < 0) or (specific and np.ma.any(moisture >= 1))):
+        raise ValueError("相对湿度输入无效：请核对温度、正气压、非负水汽量；比湿须小于 1 kg/kg")
+    epsilon = 0.622
+    vapor_pressure = (moisture * pressure / (epsilon + (1 - epsilon) * moisture)
+                      if specific else moisture * pressure / (epsilon + moisture))
+    if np.ma.any(vapor_pressure >= pressure):
+        raise ValueError("相对湿度输入无效：水汽分压须小于总气压")
+    saturation = 611.2 * np.ma.exp(17.67 * temperature / (temperature + 243.5))
+    result = np.ma.clip(np.ma.masked_invalid(100.0 * vapor_pressure / saturation), 0.0, 100.0)
+    if result.ndim == 0:
+        return None if np.ma.is_masked(result) else float(result)
     return result

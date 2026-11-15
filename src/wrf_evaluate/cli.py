@@ -2,7 +2,8 @@
 
 import argparse
 import sys
-from time import monotonic
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .catalog import iter_source_files, scan_source
 from .config import Config, ConfigError, SourceConfig, load_config
@@ -32,7 +33,14 @@ def _match_times(config: Config) -> None:
     from .matching import iter_time_matches
 
     summaries = {}
-    for match in iter_time_matches(config.sources, config.time_tolerance):
+    log_timezone = ZoneInfo(config.display_timezone)
+
+    def progress(message: str) -> None:
+        now = datetime.now(log_timezone)
+        print(f"[{now:%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+
+    for match in iter_time_matches(config.sources, config.time_tolerance,
+                                   period=config.period, progress=progress):
         key = (match.forecast.source, match.cldas_source, match.family, match.product)
         paired, missing, max_offset = summaries.get(key, (0, 0, 0.0))
         if match.observation is None:
@@ -83,14 +91,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "plot":
-            started = monotonic()
-            last_progress = started
+            log_timezone = ZoneInfo(config.display_timezone)
 
             def progress(message: str) -> None:
-                nonlocal last_progress
-                now = monotonic()
-                print(f"[已用 {now - started:.1f}s，距上条 {now - last_progress:.1f}s] {message}", flush=True)
-                last_progress = now
+                now = datetime.now(log_timezone)
+                print(f"[{now:%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
             progress("加载检验与绘图模块…")
             from .workflow import plot_comparisons

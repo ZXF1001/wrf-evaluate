@@ -12,7 +12,7 @@ from netCDF4 import Dataset
 
 from .config import PeriodConfig
 from .spatial import GridPoint, SpatialMatchError, nearest_grid_point
-from .variables import VariableConfig, convert_value
+from .variables import VariableConfig, convert_value, relative_humidity
 
 
 class WrfReadError(ValueError):
@@ -71,7 +71,12 @@ WrfValue = float | np.ma.MaskedArray | None
 def resolve_wrf_variable(
     spec: VariableConfig, values: Mapping[str, WrfValue], units: Mapping[str, str],
 ) -> tuple[WrfValue, str]:
-    """直接字段或两个同网格的 10 米风分量；点值与空间场共用同一规则。"""
+    """直接字段、10 米风速或派生湿度；点值与空间场共用同一规则。"""
+    if spec.inputs:
+        return relative_humidity(
+            {role: values[item.variable] for role, item in spec.inputs},
+            {role: units[item.variable] for role, item in spec.inputs}, spec,
+        ), "%"
     if not spec.components:
         return values[spec.variable], units[spec.variable]
     for name in spec.components:

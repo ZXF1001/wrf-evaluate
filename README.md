@@ -13,7 +13,7 @@
 interval = "6h" # 可省略，默认六小时；也支持 30min、1h 等
 ```
 
-运行会即时打印当前阶段、总耗时及距上条进度的耗时。WRF 时间索引供点位与空间图复用，CLDAS 点位取值按文件一次提取所有点位和所需变量；Excel 先筛站号、时段再解析气象数值。原始数据仍只读，无持久数据缓存。较大的 Excel 初次加载及单次底层文件读取期间只能显示当前阶段，不能报告字节级进度。
+运行会即时打印当前阶段，日志前缀为输出时的时间，格式为 `[YYYY-MM-DD HH:MM:SS]`，时区沿用 `[output].timezone`。WRF 时间索引供点位与空间图复用，CLDAS 点位取值按文件一次提取所有点位和所需变量；Excel 先筛站号、时段再解析气象数值。原始数据仍只读，无持久数据缓存。较大的 Excel 初次加载及单次底层文件读取期间只能显示当前阶段，不能报告字节级进度。
 
 ## Linux 运行
 
@@ -34,7 +34,7 @@ uv sync --locked
 
 ## 变量映射
 
-配置左侧统一使用程序要素名，右侧 `variable` 是原始文件中的一个变量名或 Excel 表头。每个要素通常映射一个变量；WRF 的 `wind_speed_10m` 是例外，默认由同一质量网格上的 `U10`、`V10` 合成，也可配置 `components = ["U10", "V10"]`。降水仍只读取所指定的一个累计或时段字段，不会自动把 `RAINC`、`RAINNC` 或 `RAINSH` 相加。单位和时间含义也在同一要素子表中配置。
+配置左侧统一使用程序要素名，右侧 `variable` 是原始文件中的一个变量名或 Excel 表头。每个要素通常映射一个变量；WRF 的 `wind_speed_10m` 默认由同一质量网格上的 `U10`、`V10` 合成，也可配置 `components = ["U10", "V10"]`。相对湿度可由 `inputs` 中指定的水汽量、温度、气压计算，详见下节。降水仍只读取所指定的一个累计或时段字段，不会自动把 `RAINC`、`RAINNC` 或 `RAINSH` 相加。单位和时间含义也在同一要素子表中配置。
 
 样例 WRF 属性明确标注：`RAINC` 为累计积云降水，`RAINNC` 为累计网格尺度降水，`RAINSH` 为累计浅积云降水，均为 mm。这能确认 WRF 的累计含义，但不能用来解释站点 Excel 的降水列。
 
@@ -95,13 +95,37 @@ interval = "1h"
 timestamp = "end"
 ```
 
-将需要的示例表复制到对应来源配置中。`config.toml` 默认只启用气温；未列入 `elements` 的映射不会进入本次读取。CLDAS 的产品代码和变量名必须分别配置。相对湿度不接受比湿直接映射；WRF 10 米风速默认由 `U10/V10` 合成，不能把单个风分量写成风速。Excel 没有可靠的单位元数据，所选每个实测变量都要在配置中填写 `units`。默认映射只覆盖样例中已经核对的字段；其余请明确指定。
+将需要的示例表复制到对应来源配置中。`config.toml` 启用气温和相对湿度；未列入 `elements` 的映射不会进入本次读取。CLDAS 的产品代码和变量名必须分别配置。相对湿度不接受比湿直接映射；WRF 10 米风速默认由 `U10/V10` 合成，不能把单个风分量写成风速。Excel 没有可靠的单位元数据，所选每个实测变量都要在配置中填写 `units`。默认映射只覆盖样例中已经核对的字段；其余请明确指定。
 
 区域站降水的上述表只是“已确认是过去一小时雨量”情况下的写法，不能仅凭表头直接照抄。当前水西沟同期样例雨量全为零，无法判断是滚动雨量还是小时内累计；程序默认拒绝使用未明确配置的站点降水。先验证 WRF/CLDAS 降水时可禁用区域站来源。辐射示例只有 WRF 映射，实际加入 `elements` 时还须配置具有相同时间含义的实况来源。
 
 降水单位 `mm/h` 只在已明确配置的 `sum` 时段中，按该时段平均雨强乘时长换成 mm；瞬时雨强不能由此推算时段雨量。辐射能量和通量也不会只改单位标签而不换算。
 
 辐射若原始变量是时段能量（J/m²），配置为 `sum` 或 `cumulative`，程序会按真实时段秒数换成平均通量 W/m²；若原始数据已经是通量则使用 `instant` 或 `mean`，并按文件时次/配置窗口绘图和检验。
+
+## 相对湿度
+
+将 `relative_humidity_2m` 加入 `elements`，即可使用已核对的默认输入：WRF 使用 `Q2/T2/PSFC`，CLDAS 使用 `SHU/QAIR`、`TMP/TAIR`、`PRS/PAIR`。站点仍直接读取映射的相对湿度列。湿度结果同时用于曲线、RMSE/MAE/Bias/R 和空间图；无需新增命令。
+
+需要更换字段名或覆盖单位时，在统一配置中填写：
+
+```toml
+[sources.wrf.variables.relative_humidity_2m.inputs]
+mixing_ratio = { variable = "Q2" }
+temperature = { variable = "T2" }
+pressure = { variable = "PSFC" }
+
+[sources.cldas.variables.relative_humidity_2m.inputs]
+specific_humidity = { variable = "QAIR", product = "SHU" }
+temperature = { variable = "TAIR", product = "TMP" }
+pressure = { variable = "PAIR", product = "PRS" }
+```
+
+每个输入可添加 `units`，省略时读取文件属性。支持温度 K/℃、气压 Pa/hPa、水汽量 kg/kg 或 g/kg。`mixing_ratio` 是水汽与干空气的质量比，`specific_humidity` 是水汽与湿空气的质量比，两者必须按实际定义二选一；不能仅按字段名字猜测。若文件已有相对湿度，改用 `variable = "实际字段名"` 和 `units = "%"`（CLDAS 还需 `product`），并删除该要素的 `inputs` 表。
+
+计算统一采用液态水饱和水汽压，低于 0℃ 也保持此口径。温度 T 使用 ℃，气压 p 使用 Pa：`es = 611.2 × exp(17.67 × T / (T + 243.5))`。混合比 r 对应 `e = p × r / (0.622 + r)`；比湿 q 对应 `e = p × q / (0.622 + 0.378 × q)`。计算 `100 × e / es` 后，派生湿度限制在 **0–100%**；直接映射的相对湿度也统一限制到此范围，避免不合理值进入曲线、指标或空间图。
+
+派生湿度只接受同刻瞬时输入，不能用平均温度、平均气压等推算平均湿度。CLDAS 各产品独立选择最新制作版本，再按同一产品系列、严格相同有效时间组合；缺少同刻输入会提示并保留缺测，空间图跳过该时刻，整个时段无有效湿度则报错。点位检查三个输入的取值经纬度一致；空间图检查完整坐标轴一致，不进行插值或重网格。负水汽量、非正气压等无效输入会报错；文件缺测掩码继续传播，不补成零。
 
 ## 指标口径
 
@@ -133,6 +157,6 @@ WRF 的 `root` 可以指向单次预报目录，也可以指向包含多个 `yyy
 .venv/bin/python -m wrf_evaluate --config config.toml match
 ```
 
-`scan` 只统计文件，`inspect` 查看 WRF/CLDAS 元数据和配置点位，`match` 仅检查 WRF 与 CLDAS 有效时间覆盖，不读变量场、不计算指标。生成的 `output/` 和项目 `.venv/` 不应复制到服务器；在目标 Linux 服务器上用锁文件重新建立环境。
+`scan` 只统计文件，`inspect` 查看 WRF/CLDAS 元数据和配置点位，`match` 按 `period`、起报时效和文件名时间段筛选后检查 WRF 与 CLDAS 有效时间覆盖，不读变量场、不计算指标；运行中会输出带当前时间的进度。生成的 `output/` 和项目 `.venv/` 不应复制到服务器；在目标 Linux 服务器上用锁文件重新建立环境。
 
 开发测试：`.venv/bin/python -m unittest discover -s tests -v`。Windows 将 `.venv/bin/python` 改为 `.venv/Scripts/python.exe`。

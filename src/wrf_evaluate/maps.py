@@ -14,8 +14,9 @@ from matplotlib.figure import Figure
 from .cldas import read_cldas_field, read_cldas_header
 from .config import Config, SourceConfig
 from .forecasts import run_order, valid_from
+from .matching import iter_cldas_input_files
 from .plotting import plot_style
-from .variables import UNITS, VariableConfig, convert_value
+from .variables import UNITS, VariableConfig, convert_value, relative_humidity
 from .wrf import read_wrf_fields, resolve_wrf_variable
 
 
@@ -29,6 +30,8 @@ def _converted(field: str, values: np.ma.MaskedArray, units: str, spec: Variable
     zero = convert_value(field, 0.0, spec.units or units, spec.time_kind, spec.interval)
     one = convert_value(field, 1.0, spec.units or units, spec.time_kind, spec.interval)
     result = np.ma.masked_invalid(np.ma.asarray(values, dtype=np.float64), copy=False) * (one - zero) + zero
+    if field == "relative_humidity_2m":
+        result = np.ma.clip(result, 0.0, 100.0)
     if field == "precipitation" and np.ma.any(result < 0):
         raise ValueError("有效降水量不能为负，请核对缺测码与累计规则")
     return result
@@ -115,6 +118,29 @@ def _crop_axis(axis: np.ndarray, lower: float, upper: float) -> slice:
     return slice(int(indices[0]), int(indices[-1]) + 1)
 
 
+def _observation_field(files, spec, field, header, selection, timezone):
+    """派生湿度在同网格的原始场上计算，只加载 WRF 范围内的 CLDAS 子区域。"""
+    values, units = {}, {}
+    headers = {header.path: header}
+    native_fields = {}
+    for role, item in spec.source_inputs:
+        path = files[role].path
+        if path not in headers:
+            headers[path] = read_cldas_header(path, timezone)
+        other = headers[path]
+        if (not np.array_equal(header.longitudes, other.longitudes)
+                or not np.array_equal(header.latitudes, other.latitudes)):
+            raise ValueError(f"{path}: CLDAS 湿度基础变量网格不一致，不能逐格组合")
+        key = path, item.variable
+        if key not in native_fields:
+            native_fields[key] = read_cldas_field(path, item.variable, selection=selection)
+        native = native_fields[key]
+        values[role], units[role] = native.values, native.units
+    if spec.inputs:
+        return relative_humidity(values, units, spec)
+    return _converted(field, values["value"], units["value"], spec)
+
+
 def _latest_field(
     runs: RunIndex, source: SourceConfig, field: str, spec: VariableConfig,
     start: datetime, end: datetime, progress: Callable[[str], None],
@@ -165,6 +191,12 @@ def plot_maps(
     if not cldas_sources:
         progress("未启用 CLDAS，跳过空间对比图")
         return
+    input_files = {
+        (source.name, field, family, time): files
+        for source in cldas_sources.values() for field in config.elements
+        if (spec := source.variable(field)) is not None
+        for family, time, files in iter_cldas_input_files(source.name, spec, cldas_index)
+    }
     count = skipped = 0
     time = config.period.start
     while time <= config.period.end:
@@ -173,9 +205,14 @@ def plot_maps(
             for (source_name, family, product), (times, files) in sorted(cldas_index.items()):
                 source = cldas_sources[source_name]
                 spec = source.variable(field)
-                if spec is None or spec.product != product or time not in times:
+                if spec is None or spec.source_inputs[0][1].product != product or time not in times:
                     continue
                 found = True
+                files_by_role = input_files[source_name, field, family, time]
+                if any(info is None for info in files_by_role.values()):
+                    progress(f"跳过空间图 {field} {time.isoformat()}：缺少同一系列、同刻湿度基础产品")
+                    skipped += 1
+                    continue
                 start, end = _window(time, spec)
                 if start < config.period.start or end > config.period.end:
                     progress(f"跳过空间图 {field} {time.isoformat()}：完整时段超出 period")
@@ -200,8 +237,8 @@ def plot_maps(
                     extent = (float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max()))
                     columns = _crop_axis(header.longitudes, *extent[:2])
                     rows = _crop_axis(header.latitudes, *extent[2:])
-                    native = read_cldas_field(info.path, spec.variable, selection=(rows, columns))
-                    observed = _converted(field, native.values, native.units, spec)
+                    observed = _observation_field(files_by_role, spec, field, header,
+                                                  (rows, columns), source.timezone)
                     if field.startswith("surface_") and spec.time_kind == "sum":
                         observed = observed / (end - start).total_seconds()
                     observation = header.longitudes[columns], header.latitudes[rows], observed

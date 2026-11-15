@@ -44,6 +44,7 @@ class CldasPointSample:
     grid_point: GridPoint
     value: float | None
     units: str
+    grid_coordinates: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -181,7 +182,8 @@ def read_cldas_points(
                         values[key] = None if np.ma.is_masked(value) or not np.isfinite(value) else float(value)
                 units = getattr(variable, "units", "")
                 samples[name] = tuple(
-                    CldasPointSample(info.path, info.time, point, values[point.row, point.column], units)
+                    CldasPointSample(info.path, info.time, point, values[point.row, point.column], units,
+                                     (float(longitudes[point.column]), float(latitudes[point.row])))
                     for point in locations
                 )
             return samples

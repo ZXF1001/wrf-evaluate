@@ -58,6 +58,13 @@ max_lead_hours = 168  # 默认 7 天；筛掉过旧起报目录及文件内超�
 [sources.wrf.variables.temperature_2m]
 variable = "T2"
 
+# 将 relative_humidity_2m 加入 elements 即启用湿度，输入字段可在这里修改。
+# 同刻混合比、温度、气压；液态水基准，计算结果限制在 0–100%。
+[sources.wrf.variables.relative_humidity_2m.inputs]
+mixing_ratio = { variable = "Q2" }
+temperature = { variable = "T2" }
+pressure = { variable = "PSFC" }
+
 # 若需要降水，将 precipitation 加入文件顶部 elements，并取消以下注释。
 # 指定哪个变量就只读哪个变量，不自动将分量求和。
 # [sources.wrf.variables.precipitation]
@@ -75,6 +82,12 @@ timezone = "UTC"
 [sources.cldas.variables.temperature_2m]
 product = "TMP"
 variable = "TAIR"
+
+# 同刻比湿、温度、气压；各产品独立选最新制作版本，缺同刻输入保留缺测。
+[sources.cldas.variables.relative_humidity_2m.inputs]
+specific_humidity = { variable = "QAIR", product = "SHU" }
+temperature = { variable = "TAIR", product = "TMP" }
+pressure = { variable = "PAIR", product = "PRS" }
 
 # [sources.cldas.variables.precipitation]
 # product = "PRE"

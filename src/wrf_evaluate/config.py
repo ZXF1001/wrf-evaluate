@@ -299,7 +299,10 @@ def load_config(path: str | Path) -> Config:
                     validate_variable(element, spec)
                     if spec.units is not None:
                         convert_value(element, None, spec.units, spec.time_kind, spec.interval)
-                    if kind == "cldas" and (spec.product is None or not re.fullmatch(r"[A-Z0-9]+", spec.product)):
+                    if kind == "cldas" and any(
+                        item.product is None or not re.fullmatch(r"[A-Z0-9]+", item.product)
+                        for _, item in spec.source_inputs
+                    ):
                         raise ValueError("CLDAS 须填写文件名产品代码 product，例如 TMP、PRE")
                     if kind == "regional" and spec.units is None:
                         raise ValueError("Excel 没有单位属性，请填写 units")
