@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .variables import (
     DEFAULT_COLUMN_MAPPING, DEFAULT_VARIABLES, DISPLAY_NAMES, VariableConfig,
-    convert_value, parse_variables, validate_variable,
+    convert_value, duration, parse_variables, validate_variable,
 )
 
 
@@ -34,6 +34,8 @@ class SourceConfig:
     enabled: bool
     files: tuple[Path, ...] = ()
     variable_mapping: tuple[tuple[str, VariableConfig], ...] = ()
+    min_lead_hours: float = 0.0
+    init_time: datetime | None = None
 
     def variable(self, field: str) -> VariableConfig | None:
         """未接入的要素没有隐式默认变量。"""
@@ -82,6 +84,7 @@ class Config:
     config_bytes: bytes | None = field(default=None, repr=False)
     display_names: tuple[tuple[str, str], ...] = tuple(DEFAULT_DISPLAY_NAMES.items())
     elements: tuple[str, ...] = ("temperature_2m",)
+    map_interval: timedelta = timedelta(hours=6)
 
     def display_name(self, field: str) -> str:
         """返回用户配置或默认的图中中文要素名称。"""
@@ -184,7 +187,14 @@ def load_config(path: str | Path) -> Config:
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"无法读取配置 {path}: {exc}") from exc
 
-    _table(raw, {"output", "sources", "matching", "metrics", "points", "period", "display_names", "elements"}, "config")
+    _table(raw, {"output", "sources", "matching", "metrics", "points", "period", "display_names", "elements", "maps"}, "config")
+    map_interval = timedelta(hours=6)
+    if "maps" in raw:
+        options = _table(raw["maps"], {"interval"}, "maps")
+        try:
+            map_interval = duration(options.get("interval", "6h"))
+        except ValueError as exc:
+            raise ConfigError(f"maps: {exc}") from exc
     elements = raw.get("elements", ["temperature_2m"])
     if not isinstance(elements, list) or not elements or any(not isinstance(item, str) or item not in DISPLAY_NAMES for item in elements):
         raise ConfigError(f"elements: 应为非空要素数组，可选 {', '.join(DISPLAY_NAMES)}")
@@ -233,10 +243,29 @@ def load_config(path: str | Path) -> Config:
     parsed = []
     for name, value in sources.items():
         field = f"sources.{name}"
-        source = _table(value, {"kind", "root", "patterns", "files", "timezone", "enabled", "variables"}, field)
+        source = _table(value, {"kind", "root", "patterns", "files", "timezone", "enabled", "variables", "min_lead_hours", "init_time"}, field)
         kind = _text(source.get("kind"), f"{field}.kind")
         if kind not in {"wrf", "cldas", "regional", "national", "ec"}:
             raise ConfigError(f"{field}.kind: 不支持的数据类型 {kind}")
+        min_lead_hours = source.get("min_lead_hours", 0)
+        if "min_lead_hours" in source and kind != "wrf":
+            raise ConfigError(f"{field}.min_lead_hours: 当前仅 WRF 来源使用")
+        if type(min_lead_hours) not in (int, float) or not math.isfinite(min_lead_hours) or min_lead_hours < 0:
+            raise ConfigError(f"{field}.min_lead_hours: 应为非负有限数值，单位小时")
+        try:
+            timedelta(hours=min_lead_hours)
+        except OverflowError as exc:
+            raise ConfigError(f"{field}.min_lead_hours: 数值过大") from exc
+        init_time = source.get("init_time")
+        if "init_time" in source:
+            if kind != "wrf":
+                raise ConfigError(f"{field}.init_time: 当前仅 WRF 来源使用")
+            try:
+                init_time = datetime.fromisoformat(init_time) if isinstance(init_time, str) else init_time
+            except ValueError as exc:
+                raise ConfigError(f"{field}.init_time: 应为含时区偏移的 ISO 日期时间") from exc
+            if not isinstance(init_time, datetime) or init_time.tzinfo is None or init_time.utcoffset() is None:
+                raise ConfigError(f"{field}.init_time: 须包含时区偏移，例如 2024-12-24T00:00:00Z")
         enabled = source.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ConfigError(f"{field}.enabled: 应为 true 或 false")
@@ -321,7 +350,7 @@ def load_config(path: str | Path) -> Config:
                 raise ConfigError(f"{field}.root: 目录不存在或无法访问: {root}")
             if output_dir.is_relative_to(root) or root.is_relative_to(output_dir):
                 raise ConfigError(f"output.directory: 不得与数据源目录重叠: {root}")
-        parsed.append(SourceConfig(name, kind, root, patterns, timezone, enabled, files, variable_mapping))
+        parsed.append(SourceConfig(name, kind, root, patterns, timezone, enabled, files, variable_mapping, float(min_lead_hours), init_time))
 
     if not any(source.enabled for source in parsed):
         raise ConfigError("sources: 至少启用一个数据源")
@@ -329,5 +358,5 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError(f"output.directory: 已存在且不是目录: {output_dir}")
     return Config(
         tuple(parsed), output_dir, display_timezone, time_tolerance,
-        tuple(map(float, thresholds)), points, period, output_name, config_bytes, display_names, tuple(elements),
+        tuple(map(float, thresholds)), points, period, output_name, config_bytes, display_names, tuple(elements), map_interval,
     )

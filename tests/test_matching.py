@@ -87,15 +87,14 @@ class TimeMatchingTests(unittest.TestCase):
         self.assertEqual(len(matches), 4)
         self.assertEqual(len({(m.cldas_source, m.family, m.product) for m in matches}), 4)
 
-    def test_multiple_forecasts_are_preserved_without_inventing_lead_time(self):
+    def test_overlapping_forecasts_choose_latest_file_initialization(self):
         second = Path('wrf/second')
         self.files['forecast'].append(second)
         start = self.time - timedelta(hours=6)
         self.headers[second] = replace(self.headers[self.forecast], path=second, model_start_time=start)
         matches = self.matches()
-        self.assertEqual({m.forecast.path for m in matches}, {self.forecast, second})
-        self.assertIsNone(matches[0].forecast.model_start_time)
-        self.assertEqual(matches[1].forecast.model_start_time, start)
+        self.assertEqual([m.forecast.path for m in matches], [second])
+        self.assertEqual(matches[0].forecast.model_start_time, start)
 
     def test_nearest_time_tie_requires_explicit_resolution(self):
         self.files['analysis'].append(self.cldas_path(valid='2024122401'))

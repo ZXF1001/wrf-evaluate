@@ -12,6 +12,7 @@ from .metrics import (
     precipitation_event_metrics, temperature_event_metrics,
 )
 from .series import Series
+from .forecasts import ForecastSeries, run_order
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,9 @@ def _nearest_pairs(forecast: Series, observation: Series, tolerance: timedelta) 
     return pairs
 
 
-def _period_pairs(forecast: Series, observation: Series) -> dict[float, list]:
+def _period_pair_records(
+    forecast: Series, observation: Series, exclude: set[int] | None = None,
+) -> list[tuple[int, float | None, float | None, float]]:
     """以实况窗口为准，只合并完整连续的预报区间，不拆分、不重复使用。
 
     滚动/重叠的预报区间只能精确匹配，不能相加；不同窗口长度分别统计。
@@ -59,11 +62,12 @@ def _period_pairs(forecast: Series, observation: Series) -> dict[float, list]:
     exact = {period: index for index, period in enumerate(bounds)}
     can_aggregate = all(a[1] <= b[0] for a, b in zip(bounds, bounds[1:]))
     used = set()
-    groups = {}
-    for (start, end), observed in zip(observation.bounds, observation.values):
+    records = []
+    for obs_index, ((start, end), observed) in enumerate(zip(observation.bounds, observation.values)):
+        if exclude and obs_index in exclude:
+            continue
         start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
         seconds = (end - start).total_seconds()
-        pairs = groups.setdefault(seconds, [])
         if (start, end) in exact:
             indices = [exact[start, end]]
         elif can_aggregate:
@@ -90,8 +94,33 @@ def _period_pairs(forecast: Series, observation: Series) -> dict[float, list]:
                     value * (bounds[index][1] - bounds[index][0]).total_seconds()
                     for index, value in zip(indices, values)
                 ) / seconds
-        pairs.append((predicted, observed))
+        records.append((obs_index, predicted, observed, seconds))
+    return records
+
+
+def _period_pairs(forecast: Series, observation: Series) -> dict[float, list]:
+    groups = {(end - start).total_seconds(): [] for start, end in observation.bounds}
+    for _, predicted, observed, seconds in _period_pair_records(forecast, observation):
+        groups.setdefault(seconds, []).append((predicted, observed))
     return groups
+
+
+def _build_comparisons(forecast: Series, observation: Series, groups: dict[float | None, list],
+                       field: str, thresholds: tuple[float, ...]) -> tuple[Comparison, ...]:
+    results = []
+    for seconds, pairs in groups.items():
+        valid = [(a, b) for a, b in pairs if a is not None and b is not None]
+        predicted = [a for a, _ in valid]
+        observed = [b for _, b in valid]
+        events = ()
+        if field == "temperature_2m":
+            events = tuple(zip(("非正温(≤0℃)", "正温(>0℃)"), temperature_event_metrics(predicted, observed)))
+        elif field == "precipitation":
+            events = tuple((f"降水≥{threshold:g}mm", precipitation_event_metrics(predicted, observed, threshold))
+                           for threshold in thresholds)
+        results.append(Comparison(forecast.label, observation.label, len(pairs), continuous_metrics(predicted, observed),
+                                  forecast.unit, seconds, events))
+    return tuple(results)
 
 
 def compare_series(
@@ -115,26 +144,32 @@ def compare_series(
             f"({forecast.statistic}/{observation.statistic})，不能直接计算指标"
         )
 
-    results = []
-    for seconds, pairs in groups.items():
-        valid = [(a, b) for a, b in pairs if a is not None and b is not None]
-        predicted = [a for a, _ in valid]
-        observed = [b for _, b in valid]
-        events = ()
-        if field == "temperature_2m":
-            events = tuple(zip(
-                ("非正温(≤0℃)", "正温(>0℃)"), temperature_event_metrics(predicted, observed),
-            ))
-        elif field == "precipitation":
-            events = tuple(
-                (f"降水≥{threshold:g}mm", precipitation_event_metrics(predicted, observed, threshold))
-                for threshold in thresholds
-            )
-        results.append(Comparison(
-            forecast.label, observation.label, len(pairs), continuous_metrics(predicted, observed),
-            forecast.unit, seconds, events,
-        ))
-    return tuple(results)
+    return _build_comparisons(forecast, observation, groups, field, thresholds)
+
+
+def compare_forecast(
+    forecast: ForecastSeries, observation: Series, tolerance: timedelta,
+    field: str, thresholds: tuple[float, ...] = (),
+) -> tuple[Comparison, ...]:
+    """瞬时序列使用最新合并结果；时段量按完整窗口选择最新可覆盖的批次。"""
+    if not isinstance(tolerance, timedelta) or tolerance < timedelta(0):
+        raise ValueError("时间配对容差须为非负 timedelta")
+    if forecast.series.statistic == observation.statistic == "instant":
+        return compare_series(forecast.series, observation, tolerance, field, thresholds)
+    if forecast.series.unit != observation.unit:
+        raise ValueError("指标计算前须统一单位")
+    if forecast.series.statistic != observation.statistic:
+        if not (field == "wind_speed_10m" and {forecast.series.statistic, observation.statistic} == {"instant", "mean"}):
+            raise ValueError(f"{forecast.series.label} / {observation.label}: 时间含义不同，不能直接计算指标")
+        return compare_series(forecast.series, observation, tolerance, field, thresholds)
+    selected = {}
+    for _, run in sorted(forecast.runs, key=lambda item: run_order(item[0]), reverse=True):
+        for obs_index, predicted, observed, seconds in _period_pair_records(run, observation, set(selected)):
+            selected.setdefault(obs_index, (predicted, observed, seconds))
+    groups = {(end - start).total_seconds(): [] for start, end in observation.bounds}
+    for predicted, observed, seconds in selected.values():
+        groups.setdefault(seconds, []).append((predicted, observed))
+    return _build_comparisons(forecast.series, observation, groups, field, thresholds)
 
 
 def write_metrics(path: str | Path, comparisons: Sequence[Comparison]) -> Path:

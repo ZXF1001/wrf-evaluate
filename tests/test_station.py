@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from wrf_evaluate.config import DEFAULT_COLUMN_MAPPING
+from wrf_evaluate.config import DEFAULT_COLUMN_MAPPING, PeriodConfig
 from wrf_evaluate.station import StationReadError, iter_regional_observations
 
 
@@ -36,6 +36,18 @@ class StationParsingTests(unittest.TestCase):
         self.assertEqual(observation.time.second, 5)
         self.assertEqual(observation.values['wind_speed_10m'], 2.1)
         self.assertEqual(observation.values['precipitation'], 0.4)
+
+    def test_filtering_skips_unselected_values_and_preserves_row_numbers(self):
+        outside = self.row.copy()
+        outside[3], outside[4] = 'unused', '20230102030405'
+        other = self.row.copy()
+        other[2], other[3] = 'other', 'unused'
+        self.sheet.iter_rows.return_value = iter([self.header, outside, other, self.row])
+        period = PeriodConfig(datetime(2024, 1, 1, tzinfo=ZoneInfo('UTC')),
+                              datetime(2024, 1, 3, tzinfo=ZoneInfo('UTC')))
+        row, = iter_regional_observations(self.path, 'UTC', station_ids={'Y5012'}, period=period)
+        self.assertEqual(row.row, 4)
+        self.assertEqual(row.values['temperature_2m'], -12.1)
 
     def test_invalid_mapping_fails_before_opening_workbook(self):
         for mapping in [{"unknown": "气温"}, {"temperature_2m": "区站号"}, {"time": 1}]:

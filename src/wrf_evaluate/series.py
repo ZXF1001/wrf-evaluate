@@ -44,7 +44,8 @@ class Series:
 def normalize_series(
     label: str, field: str, spec: VariableConfig,
     records: list[tuple[datetime, float | None, str, str]], period: PeriodConfig,
-) -> Series:
+    *, allow_empty: bool = False,
+) -> Series | None:
     """records 为 (时间, 原值, 原单位, 来源位置)。累计量须包含所需区间的前值。"""
     validate_variable(field, spec)
     records.sort(key=lambda row: row[0].astimezone(timezone.utc))
@@ -83,7 +84,9 @@ def normalize_series(
         except ValueError as exc:
             raise ValueError(f"{label} {location}: {exc}") from exc
     if not times:
+        if allow_empty:
+            return None
         raise ValueError(f"{label}: 配置时段内没有可用记录或完整区间；累计量需要前一个时次")
-    if all(value is None for value in values):
+    if not allow_empty and all(value is None for value in values):
         raise ValueError(f"{label}: 配置时段内数值全部缺测")
     return Series(label, tuple(times), tuple(values), tuple(bounds), statistic, UNITS[field])

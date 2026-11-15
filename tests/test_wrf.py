@@ -15,7 +15,7 @@ from wrf_evaluate.cli import main
 from wrf_evaluate.spatial import nearest_grid_point
 from wrf_evaluate.config import PeriodConfig
 from wrf_evaluate.wrf import (
-    WrfField, WrfReadError, iter_wrf_point_frames, read_wrf_field,
+    WrfField, WrfReadError, iter_wrf_point_frames, iter_wrf_points_frames, read_wrf_field,
     read_wrf_fields, read_wrf_header, sample_wrf_station,
 )
 
@@ -112,6 +112,21 @@ class WrfReaderTests(unittest.TestCase):
             dimensions = ("Time", "south_north", "west_east")
             dataset.createVariable("XLAT", "f4", dimensions)[:] = [[43, 43, 43], [44, 44, 44]]
             dataset.createVariable("XLONG", "f4", dimensions)[:] = [[87, 88, 89], [87, 88, 89]]
+
+    def test_multi_point_frames_share_one_read_and_preserve_independent_values(self):
+        self.add_coordinates()
+        with patch("wrf_evaluate.wrf.Dataset", wraps=Dataset) as open_dataset, \
+             patch("wrf_evaluate.wrf.nearest_grid_point", wraps=nearest_grid_point) as locate:
+            frames = list(iter_wrf_points_frames(
+                self.path, ["T2"], "UTC", ((87.01, 43.01), (88.01, 43.01), (87.02, 43.02)),
+            ))
+        open_dataset.assert_called_once_with(self.path, mode="r")
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(len(frames[0]), 3)
+        self.assertEqual(locate.call_count, 3)
+        self.assertEqual([frame.column for frame in frames[0]], [0, 1, 0])
+        self.assertEqual([frame.values["T2"] for frame in frames[1]], [274, None, 274])
+        self.assertEqual(frames[0][0].model_start_time, datetime(2024, 12, 23, 12, tzinfo=timezone.utc))
 
     def test_point_frames_keep_native_times_units_and_reuse_static_grid(self):
         self.add_coordinates()

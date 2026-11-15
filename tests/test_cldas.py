@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 from netCDF4 import Dataset
 
-from wrf_evaluate.cldas import CldasReadError, read_cldas_field, read_cldas_header, read_cldas_point
+from wrf_evaluate.cldas import CldasReadError, read_cldas_field, read_cldas_header, read_cldas_point, read_cldas_points
 from wrf_evaluate.cli import main
 
 
@@ -78,19 +78,6 @@ class CldasReaderTests(unittest.TestCase):
             with self.assertRaises(CldasReadError):
                 read_cldas_point(self.path, name, 86, 43)
 
-    def test_point_reads_only_one_weather_value(self):
-        dataset = MagicMock()
-        dataset.__enter__.return_value = dataset
-        variable = MagicMock(dimensions=("LAT", "LON"), dtype=np.dtype("f4"), units="K")
-        dataset.variables = {"TAIR": variable}
-        variable.__getitem__.return_value = np.float32(271)
-        with patch("wrf_evaluate.cldas.Dataset", return_value=dataset), patch(
-            "wrf_evaluate.cldas._read_axis", side_effect=[np.array([86, 87, 88]), np.array([44, 43])],
-        ):
-            read_cldas_point(self.path, "TAIR", 86, 43)
-        variable.__getitem__.assert_called_once_with((1, 0))
-        dataset.__exit__.assert_called_once()
-
     def test_invalid_filename_date_timezone_or_field_are_rejected(self):
         for name in ("2024122400.nc", "HOR-TMP-2024132400.nc", "HOR-TMP-2024122424.nc", "HOR-TMP-202412240000.nc"):
             with self.subTest(name=name), self.assertRaises(CldasReadError):
@@ -149,6 +136,47 @@ timezone = "UTC"
         with self.assertRaises(CldasReadError) as error:
             read_cldas_field(self.path, "label")
         self.assertIn(str(self.path), str(error.exception))
+
+
+class CldasPointIOTests(unittest.TestCase):
+    """验证点读取次数，不依赖临时 NetCDF 文件。"""
+
+    def setUp(self):
+        self.path = Path("Z_NAFP_C_BABJ_20241226000900_P_CLDAS_NRT_ASI_0P0625_HOR-TMP-2024122400.nc")
+
+    def test_point_reads_only_one_weather_value(self):
+        dataset = MagicMock()
+        dataset.__enter__.return_value = dataset
+        variable = MagicMock(dimensions=("LAT", "LON"), dtype=np.dtype("f4"), units="K")
+        dataset.variables = {"TAIR": variable}
+        variable.__getitem__.return_value = np.float32(271)
+        with patch("wrf_evaluate.cldas.Dataset", return_value=dataset), patch(
+            "wrf_evaluate.cldas._read_axis", side_effect=[np.array([86, 87, 88]), np.array([44, 43])],
+        ):
+            read_cldas_point(self.path, "TAIR", 86, 43)
+        variable.__getitem__.assert_called_once_with((1, 0))
+        dataset.__exit__.assert_called_once()
+
+    def test_multiple_point_values_and_variables_share_open_and_duplicate_grid_reads(self):
+        dataset = MagicMock()
+        dataset.__enter__.return_value = dataset
+        fields = {
+            name: MagicMock(dimensions=("LAT", "LON"), dtype=np.dtype("f4"), units=unit)
+            for name, unit in (("TAIR", "K"), ("RH", "%"))
+        }
+        dataset.variables = fields
+        fields["TAIR"].__getitem__.side_effect = lambda index: np.float32(270 + index[0])
+        fields["RH"].__getitem__.side_effect = lambda index: np.float32(70 + index[0])
+        points = ((86, 44), (86.01, 43.99), (87, 43))
+        with patch("wrf_evaluate.cldas.Dataset", return_value=dataset), patch(
+            "wrf_evaluate.cldas._read_axis", side_effect=[np.array([86, 87, 88]), np.array([44, 43])],
+        ):
+            samples = read_cldas_points(self.path, ("TAIR", "RH"), points)
+        dataset.__exit__.assert_called_once()
+        self.assertEqual(fields["TAIR"].__getitem__.call_count, 2)
+        self.assertEqual(fields["RH"].__getitem__.call_count, 2)
+        self.assertEqual([sample.value for sample in samples["TAIR"]], [270, 270, 271])
+        self.assertEqual([sample.units for sample in samples["RH"]], ["%"] * 3)
 
 
 if __name__ == "__main__":

@@ -1,23 +1,26 @@
 """配置到点位曲线和指标的直接流程；逐点处理，工作簿和文件索引复用。"""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
 import re
+from time import monotonic
 
 from .catalog import iter_source_files
-from .cldas import read_cldas_point
-from .config import Config, ConfigError, PeriodConfig, PointConfig, SourceConfig
-from .evaluation import Comparison, compare_series, write_metrics
+from .cldas import read_cldas_points
+from .config import Config, ConfigError, PointConfig, SourceConfig
+from .evaluation import Comparison, compare_forecast, write_metrics
+from .forecasts import eligible_series, forecast_init_time, select_latest, valid_from
 from .matching import index_cldas_files
+from .maps import plot_maps
 from .output import create_run_directory
 from .plotting import plot_series
 from .series import Series, normalize_series
 from .station import iter_regional_observations
 from .variables import convert_value, validate_variable
-from .wrf import iter_wrf_point_frames, read_wrf_header
+from .wrf import iter_wrf_points_frames
 
 
 @dataclass(frozen=True)
@@ -69,21 +72,15 @@ def _validate_sources(config: Config) -> list[SourceConfig]:
     return sources
 
 
-def _wrf_files(source: SourceConfig, period: PeriodConfig) -> tuple[Path, ...]:
-    files, starts = [], set()
-    for path in iter_source_files(source):
-        header = read_wrf_header(path, source.timezone)
-        if any(period.start <= time <= period.end for time in header.times):
-            files.append(path)
-            starts.add(header.model_start_time)
-    if not files:
-        raise ValueError(f"sources.{source.name}: 配置时段内没有 WRF 时次")
-    if len(starts) > 1:
-        raise ValueError(f"sources.{source.name}: 模式起始时间属性不一致，请将不同批次分开配置来源")
-    return tuple(files)
+def _notify(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
 
 
-def _regional_series(sources: list[SourceConfig], config: Config) -> dict:
+def _regional_series(
+    sources: list[SourceConfig], config: Config,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
     station_ids = {point.station_id for point in config.points if point.station_id}
     result = {}
     if not station_ids:
@@ -93,18 +90,26 @@ def _regional_series(sources: list[SourceConfig], config: Config) -> dict:
         if source.kind != "regional" or not fields:
             continue
         records = {(station_id, field): [] for station_id in station_ids for field in fields}
+        count = 0
+        last_report = monotonic() - 5
+        _notify(progress, f"读取站点来源 {source.name}…")
         for path in iter_source_files(source):
+            count += 1
+            now = monotonic()
+            if count == 1 or now - last_report >= 5:
+                _notify(progress, f"读取站点 Excel：第 {count:,} 个，{path.name}")
+                last_report = now
             with closing(iter_regional_observations(
                 path, source.timezone, dict(source.column_mapping), fields=fields,
+                station_ids=station_ids, period=config.period, progress=progress,
             )) as rows:
                 for row in rows:
-                    if row.station_id not in station_ids or not config.period.start <= row.time <= config.period.end:
-                        continue
                     for field in fields:
                         spec = source.variable(field)
                         records[row.station_id, field].append(
                             (row.time, row.values[field], spec.units, f"{path} 第 {row.row} 行")
                         )
+        _notify(progress, f"站点观测读取完成：检查 {count:,} 个 Excel")
         for (station_id, field), rows in records.items():
             if not rows:
                 raise ValueError(
@@ -136,84 +141,191 @@ def _label(source: SourceConfig, field: str, *, station_id: str | None = None) -
     return name
 
 
-def _wrf_series(source: SourceConfig, files: tuple[Path, ...], point: PointConfig, config: Config) -> dict:
+def _wrf_series(
+    source: SourceConfig, config: Config,
+    progress: Callable[[str], None] | None = None,
+    *, map_frames: dict | None = None,
+) -> dict:
     fields = _fields(source, config)
-    records = {field: [] for field in fields}
+    run_records = {}
     names = tuple(dict.fromkeys(source.variable(field).variable for field in fields))
     if not names:
         return {}
-    for path in files:
-        with closing(iter_wrf_point_frames(
-            path, names, source.timezone, point.longitude, point.latitude, period=config.period,
+    frames_read = 0
+    files_read = 0
+    coordinates = tuple((point.longitude, point.latitude) for point in config.points)
+    last_report = monotonic() - 5
+    reported_starts = set()
+    _notify(progress, f"读取 WRF 来源 {source.name}：一次提取 {len(coordinates)} 个点位…")
+    for path in iter_source_files(source):
+        files_read += 1
+        now = monotonic()
+        if files_read == 1 or now - last_report >= 5:
+            _notify(progress, f"{source.name}：检查文件 {files_read:,}，已取 {frames_read:,} 个时次；当前 {path.name}")
+            last_report = now
+        directory_start = forecast_init_time(source, path, require=False)
+        with closing(iter_wrf_points_frames(
+            path, names, source.timezone, coordinates, period=config.period,
+            init_time=directory_start, min_lead_hours=source.min_lead_hours,
         )) as frames:
-            for frame in frames:
-                for field in fields:
-                    name = source.variable(field).variable
-                    records[field].append(
-                        (frame.time, frame.values[name], frame.units[name], f"{path} Time[{frame.time_index}]")
+            start = None
+            for batch in frames:
+                frames_read += 1
+                if start is None:
+                    start = forecast_init_time(source, path, batch[0].model_start_time)
+                eligible_from = valid_from(source, start)
+                if eligible_from is not None and batch[0].time < eligible_from:
+                    continue
+                if start not in reported_starts:
+                    _notify(progress, f"{source.name} 起报：{start.isoformat() if start else '未提供'}；"
+                            f"最低预报时效 {source.min_lead_hours:g} 小时")
+                    reported_starts.add(start)
+                if directory_start is not None and batch[0].model_start_time not in (None, directory_start):
+                    mismatch = (directory_start, batch[0].model_start_time)
+                    if mismatch not in reported_starts:
+                        _notify(progress, f"{path}: 采用目录/配置起报 {directory_start.isoformat()}；"
+                                f"文件模式起始时间为 {batch[0].model_start_time.isoformat()}")
+                        reported_starts.add(mismatch)
+                if start not in run_records:
+                    run_records[start] = {(point.name, field): [] for point in config.points for field in fields}
+                if map_frames is not None:
+                    map_frames.setdefault(start, {})[batch[0].time] = (path, batch[0].time_index)
+                now = monotonic()
+                if now - last_report >= 5:
+                    _notify(progress, f"读取 WRF 时次：已处理 {frames_read:,} 个")
+                    last_report = now
+                for point, frame in zip(config.points, batch, strict=True):
+                    for field in fields:
+                        name = source.variable(field).variable
+                        run_records[start][point.name, field].append(
+                            (frame.time, frame.values[name], frame.units[name], f"{path} Time[{frame.time_index}]")
+                        )
+    _notify(progress, f"{source.name} 取值完成：检查 {files_read:,} 个文件，时段内 {frames_read:,} 个时次")
+    if not run_records:
+        raise ValueError(f"sources.{source.name}: 配置时段内没有满足 min_lead_hours 的 WRF 时次")
+    result = {}
+    for point in config.points:
+        for field in fields:
+            runs = []
+            for start, records in run_records.items():
+                try:
+                    curve = normalize_series(
+                        _label(source, field), field, source.variable(field), records[point.name, field],
+                        config.period, allow_empty=True,
                     )
-    return {
-        field: normalize_series(_label(source, field), field, source.variable(field), rows, config.period)
-        for field, rows in records.items()
-    }
+                    curve = eligible_series(curve, valid_from(source, start))
+                except ValueError as exc:
+                    raise ValueError(f"点位 {point.name}: {exc}") from exc
+                if curve is not None:
+                    runs.append((start, curve))
+            if not runs:
+                raise ValueError(f"点位 {point.name}: {field} 的有效预报时效内没有可用 WRF 记录")
+            try:
+                result[point.name, field] = select_latest(runs)
+            except ValueError as exc:
+                raise ValueError(f"点位 {point.name}: {exc}") from exc
+    return result
 
 
-def plot_comparisons(config: Config) -> Iterator[PlotResult]:
-    """各来源按原生时次叠图；指标另行配对，输出独立运行目录与配置副本。"""
+def _cldas_series(
+    cldas: list[SourceConfig], index: dict, config: Config,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    """每个产品文件只打开一次，提取全部点位及所需变量。"""
+    cldas_curves = {}
+    point_coordinates = tuple((point.longitude, point.latitude) for point in config.points)
+    for source in cldas:
+        fields = _fields(source, config)
+        groups = {}
+        for field in fields:
+            spec = source.variable(field)
+            for key, (_, files) in index.items():
+                if key[0] == source.name and key[2] == spec.product:
+                    groups.setdefault(key, {"files": files, "fields": []})["fields"].append(field)
+        for (_, family, _), group in sorted(groups.items()):
+            fields = tuple(group["fields"])
+            names = tuple(dict.fromkeys(source.variable(field).variable for field in fields))
+            samples_by_field = {field: [[] for _ in config.points] for field in fields}
+            files = group["files"]
+            last_report = monotonic() - 5
+            _notify(progress, f"读取 CLDAS {source.name}/{family}：{len(files)} 个文件 × {len(config.points)} 个点位")
+            for file_index, info in enumerate(files, start=1):
+                now = monotonic()
+                if file_index == 1 or now - last_report >= 5:
+                    _notify(progress, f"读取 CLDAS：{file_index}/{len(files)} 个文件")
+                    last_report = now
+                samples = read_cldas_points(info.path, names, point_coordinates, source.timezone)
+                for field in fields:
+                    variable = source.variable(field).variable
+                    for point_index, sample in enumerate(samples[variable]):
+                        samples_by_field[field][point_index].append(
+                            (sample.time, sample.value, sample.units, str(info.path))
+                        )
+            for field, point_rows in samples_by_field.items():
+                for point_index, rows in enumerate(point_rows):
+                    label = _label(source, field)
+                    if len(cldas) > 1 or sum(key[2] == source.variable(field).product for key in groups) > 1:
+                        label += f" / {source.name} / {family}"
+                    key = (config.points[point_index].name, field)
+                    cldas_curves.setdefault(key, []).append(
+                        normalize_series(label, field, source.variable(field), rows, config.period)
+                    )
+    return cldas_curves
+
+
+def plot_comparisons(
+    config: Config, *, progress: Callable[[str], None] | None = None,
+) -> Iterator[PlotResult]:
+    """各来源按原生时次叠图；指标另行配对，可选报告处理进度。"""
+    _notify(progress, f"开始检验：{len(config.points)} 个点位，{len(config.elements)} 个要素。")
     sources = _validate_sources(config)
     wrf = [source for source in sources if source.kind == "wrf" and _fields(source, config)]
     cldas = [source for source in sources if source.kind == "cldas" and _fields(source, config)]
-    wrf_files = {source.name: _wrf_files(source, config.period) for source in wrf}
-    index = index_cldas_files(cldas, period=config.period) if cldas else {}
+    if cldas:
+        _notify(progress, "索引 CLDAS 文件并选择最新制作版本…")
+    index = index_cldas_files(cldas, period=config.period, progress=progress) if cldas else {}
     for source in cldas:
         for field in _fields(source, config):
             product = source.variable(field).product
             if not any(key[0] == source.name and key[2] == product for key in index):
                 raise ValueError(f"sources.{source.name}: 配置时段内没有 CLDAS {product} 产品")
-    station_curves = _regional_series(sources, config)
+    station_curves = _regional_series(sources, config, progress)
+    forecasts = {(point.name, field): [] for point in config.points for field in config.elements}
+    map_frames = {}
+    for source in wrf:
+        map_frames[source.name] = {}
+        for key, curve in _wrf_series(source, config, progress, map_frames=map_frames[source.name]).items():
+            forecasts[key].append(curve)
+    cldas_curves = _cldas_series(cldas, index, config, progress)
     output_dir = None
     stamp = f"{config.period.start.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}_{config.period.end.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
     for point_index, point in enumerate(config.points, start=1):
         try:
-            forecasts = {field: [] for field in config.elements}
-            for source in wrf:
-                for field, curve in _wrf_series(source, wrf_files[source.name], point, config).items():
-                    forecasts[field].append(curve)
+            _notify(progress, f"处理点位 {point_index}/{len(config.points)}：{point.name}")
             for field in config.elements:
-                observations = []
-                for source in cldas:
-                    spec = source.variable(field)
-                    if spec is None:
-                        continue
-                    groups = [(key, files) for key, (_, files) in sorted(index.items())
-                              if key[0] == source.name and key[2] == spec.product]
-                    for (_, family, _), files in groups:
-                        records = []
-                        for info in files:
-                            sample = read_cldas_point(
-                                info.path, spec.variable, point.longitude, point.latitude, source.timezone,
-                            )
-                            records.append((sample.time, sample.value, sample.units, str(info.path)))
-                        label = _label(source, field)
-                        if len(cldas) > 1 or len(groups) > 1:
-                            label += f" / {source.name} / {family}"
-                        observations.append(normalize_series(label, field, spec, records, config.period))
+                observations = list(cldas_curves.get((point.name, field), ()))
                 observations.extend(station_curves.get((point.station_id, field), ()))
+                _notify(progress, f"计算 {point.name} 的 {config.display_name(field)}指标…")
                 comparisons = tuple(
                     comparison
-                    for forecast in forecasts[field] for observation in observations
-                    for comparison in compare_series(
+                    for forecast in forecasts[point.name, field] for observation in observations
+                    for comparison in compare_forecast(
                         forecast, observation, config.time_tolerance, field, config.precipitation_thresholds_mm,
                     )
                 )
-                curves = tuple(forecasts[field]) + tuple(observations)
+                curves = tuple(forecast.series for forecast in forecasts.pop((point.name, field))) + tuple(observations)
                 name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", point.name).strip(" .") or "point"
                 if output_dir is None:
+                    _notify(progress, "创建本次独立输出目录…")
                     output_dir = create_run_directory(config)
                 path = output_dir / f"{field}_{point_index:03d}_{name}_{stamp}.png"
+                _notify(progress, f"绘制 {point.name} 的 {config.display_name(field)}…")
                 plot_series(path, point, curves, config.display_timezone, period=config.period,
                             element_name=config.display_name(field))
+                _notify(progress, f"写入 {path.name} 对应 CSV…")
                 metrics_path = write_metrics(path.with_suffix(".csv"), comparisons)
                 yield PlotResult(point, field, path, curves, metrics_path, comparisons)
         except (OSError, ValueError) as exc:
             raise ValueError(f"点位 {point.name}: {exc}") from exc
+    if output_dir is not None:
+        plot_maps(config, sources, index, map_frames, output_dir, lambda message: _notify(progress, message))

@@ -10,9 +10,12 @@ from unittest.mock import patch
 
 from wrf_evaluate.cli import main
 from wrf_evaluate.cldas import CldasPointSample, parse_cldas_filename
-from wrf_evaluate.config import Config, ConfigError, PeriodConfig, PointConfig, SourceConfig
+from wrf_evaluate.config import Config, ConfigError, PeriodConfig, PointConfig, SourceConfig, load_config
 from wrf_evaluate.station import StationObservation
-from wrf_evaluate.workflow import plot_comparisons
+from wrf_evaluate.workflow import _wrf_series, plot_comparisons
+from wrf_evaluate.forecasts import eligible_series, forecast_init_time, select_latest
+from wrf_evaluate.evaluation import compare_forecast
+from wrf_evaluate.series import Series
 from wrf_evaluate.variables import VariableConfig
 from wrf_evaluate.wrf import WrfHeader, WrfPointFrame
 
@@ -47,15 +50,15 @@ class ComparisonWorkflowTests(unittest.TestCase):
 
         def sample(path, *args):
             info = parse_cldas_filename(path)
-            return CldasPointSample(path, info.time, None, 274.15, 'K')
+            return {name: tuple(CldasPointSample(path, info.time, None, 274.15, 'K') for _ in args[1]) for name in args[0]}
 
         self.start_patch('wrf_evaluate.workflow.iter_source_files', side_effect=files)
         self.start_patch('wrf_evaluate.matching.iter_source_files', side_effect=files)
-        self.headers = self.start_patch('wrf_evaluate.workflow.read_wrf_header', side_effect=lambda *args: self.header)
-        self.read_frames = self.start_patch('wrf_evaluate.workflow.iter_wrf_point_frames', side_effect=lambda *args, **kwargs: (frame for frame in self.frames))
-        self.read_station = self.start_patch('wrf_evaluate.workflow.iter_regional_observations', side_effect=lambda *args, **kwargs: (row for row in self.rows))
-        self.read_cldas = self.start_patch('wrf_evaluate.workflow.read_cldas_point', side_effect=sample)
+        self.read_frames = self.start_patch('wrf_evaluate.workflow.iter_wrf_points_frames', side_effect=lambda *args, **kwargs: (tuple(frame for _ in args[3]) for frame in self.frames))
+        self.read_station = self.start_patch('wrf_evaluate.workflow.iter_regional_observations', side_effect=lambda *args, **kwargs: (row for row in self.rows if row.station_id in kwargs['station_ids'] and kwargs['period'].start <= row.time <= kwargs['period'].end))
+        self.read_cldas = self.start_patch('wrf_evaluate.workflow.read_cldas_points', side_effect=sample)
         self.draw = self.start_patch('wrf_evaluate.workflow.plot_series')
+        self.maps = self.start_patch('wrf_evaluate.workflow.plot_maps')
         self.write_metrics = self.start_patch('wrf_evaluate.workflow.write_metrics', side_effect=lambda path, *args: path)
         self.run_directory = self.start_patch(
             'wrf_evaluate.workflow.create_run_directory', return_value=Path('unused-output/test-run_20261115_120000_000001'),
@@ -73,9 +76,12 @@ class ComparisonWorkflowTests(unittest.TestCase):
         second = replace(self.point, name='second', station_id='Y5013')
         self.rows.append(replace(self.row(0, -1), station_id='Y5013'))
         results = list(plot_comparisons(replace(self.config, points=(self.point, second))))
-        self.read_station.assert_called_once_with(self.excel, 'UTC', dict(self.station.column_mapping), fields=('temperature_2m',))
-        self.headers.assert_called_once()
+        self.assertEqual(self.read_station.call_args.kwargs['fields'], ('temperature_2m',))
+        self.read_frames.assert_called_once()
+        self.assertEqual(self.read_frames.call_args.args[3], ((87.5, 43.5), (87.5, 43.5)))
         self.assertEqual(len(results), 2)
+        self.read_cldas.assert_called_once()
+        self.assertEqual(len(self.read_cldas.call_args.args[2]), 2)
         wrf, cldas, station = results[0].series
         self.assertEqual(wrf.values, (0, 2))
         self.assertEqual(cldas.values, (1,))
@@ -97,7 +103,7 @@ class ComparisonWorkflowTests(unittest.TestCase):
         outside = Path(str(self.cldas_path).replace('TMP-2024122400', 'TMP-2024122402'))
         self.files['cldas'] += [older, outside]
         list(plot_comparisons(self.config))
-        self.read_cldas.assert_called_once_with(self.cldas_path, 'TAIR', 87.5, 43.5, 'UTC')
+        self.read_cldas.assert_called_once_with(self.cldas_path, ('TAIR',), ((87.5, 43.5),), 'UTC')
 
     def test_source_variables_and_display_name_reach_readers_and_plot(self):
         wrf = replace(self.wrf, variable_mapping=(('temperature_2m', VariableConfig('CUSTOM_T2')),))
@@ -109,10 +115,8 @@ class ComparisonWorkflowTests(unittest.TestCase):
                                units={'CUSTOM_T2': 'K'}) for frame in self.frames]
         result, = plot_comparisons(config)
         self.assertEqual(self.read_frames.call_args.args[1], ('CUSTOM_T2',))
-        self.read_cldas.assert_called_once_with(self.cldas_path, 'CUSTOM_TAIR', 87.5, 43.5, 'UTC')
-        self.read_station.assert_called_once_with(
-            self.excel, 'UTC', dict(station.column_mapping), fields=('temperature_2m',),
-        )
+        self.read_cldas.assert_called_once_with(self.cldas_path, ('CUSTOM_TAIR',), ((87.5, 43.5),), 'UTC')
+        self.assertEqual(self.read_station.call_args.kwargs['fields'], ('temperature_2m',))
         self.assertEqual(self.draw.call_args.kwargs['element_name'], '自定义温度')
         self.assertEqual(result.series[0].label, 'wrf')
         self.assertEqual(result.series[0].values, (0, 2))
@@ -130,9 +134,9 @@ class ComparisonWorkflowTests(unittest.TestCase):
 
         def sample(path, *args):
             info = parse_cldas_filename(path)
-            return CldasPointSample(path, info.time, None,
+            return {args[0][0]: tuple(CldasPointSample(path, info.time, None,
                                     0.5 if info.product == 'PRE' else 274.15,
-                                    'mm/h' if info.product == 'PRE' else 'K')
+                                    'mm/h' if info.product == 'PRE' else 'K') for _ in args[1])}
 
         self.read_cldas.side_effect = sample
         config = replace(self.config, sources=(wrf, cldas),
@@ -140,7 +144,7 @@ class ComparisonWorkflowTests(unittest.TestCase):
         temperature, rain_result = plot_comparisons(config)
         self.read_frames.assert_called_once()
         self.assertEqual(self.read_frames.call_args.args[1], ('T2', 'RAINC'))
-        self.assertEqual([call.args[1] for call in self.read_cldas.call_args_list], ['TAIR', 'PRCP'])
+        self.assertCountEqual([call.args[1] for call in self.read_cldas.call_args_list], [('TAIR',), ('PRCP',)])
         self.assertEqual(rain_result.series[0].values, (1,))
         self.assertEqual(rain_result.series[1].values, (0.5,))
         self.assertEqual(rain_result.series[1].label, 'cldas')
@@ -157,7 +161,6 @@ class ComparisonWorkflowTests(unittest.TestCase):
         config = replace(self.config, sources=(wrf, self.station), elements=('precipitation',))
         with self.assertRaisesRegex(ConfigError, 'station.variables.precipitation.*time_kind'):
             list(plot_comparisons(config))
-        self.headers.assert_not_called()
         self.read_station.assert_not_called()
 
     def test_requested_station_fields_are_read_together(self):
@@ -176,17 +179,17 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.read_frames.assert_called_once()
         self.assertEqual(results[1].comparisons[0].metrics.bias, 10)
 
-    def test_duplicate_station_times_report_origin_before_plot(self):
-        self.rows.append(self.row(0, 2))
-        with self.assertRaisesRegex(ValueError, 'selected.xls.*第 100 行'):
-            list(plot_comparisons(self.config))
-        self.draw.assert_not_called()
-
     def test_missing_station_or_wrong_period_is_not_silently_omitted(self):
         for rows in ([], [self.row(-5, 1)], [replace(self.row(0, 1), station_id='wrong')]):
             self.rows = rows
             with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, 'station_id'):
                 list(plot_comparisons(self.config))
+        self.draw.assert_not_called()
+
+    def test_duplicate_station_times_report_origin_before_plot(self):
+        self.rows.append(self.row(0, 2))
+        with self.assertRaisesRegex(ValueError, 'selected.xls.*第 100 行'):
+            list(plot_comparisons(self.config))
         self.draw.assert_not_called()
 
     def test_unknown_temperature_units_fail_before_plot(self):
@@ -208,8 +211,8 @@ class ComparisonWorkflowTests(unittest.TestCase):
             list(plot_comparisons(config))
         self.frames = [replace(frame, values={'T2': 273.15}) for frame in self.frames]
         self.read_cldas.side_effect = None
-        self.read_cldas.return_value = CldasPointSample(self.cldas_path, self.time, None, None, 'K')
-        with self.assertRaisesRegex(ValueError, '点位 test: cldas.*全部缺测'):
+        self.read_cldas.return_value = {'TAIR': (CldasPointSample(self.cldas_path, self.time, None, None, 'K'),)}
+        with self.assertRaisesRegex(ValueError, 'cldas.*全部缺测'):
             list(plot_comparisons(self.config))
         self.draw.assert_not_called()
 
@@ -218,19 +221,19 @@ class ComparisonWorkflowTests(unittest.TestCase):
                          points=(self.point, replace(self.point, name='second', station_id=None)))
         with self.assertRaisesRegex(ConfigError, 'second.*station_id'):
             list(plot_comparisons(config))
-        self.headers.assert_not_called()
         self.read_station.assert_not_called()
         self.draw.assert_not_called()
 
-    def test_later_point_failure_names_the_point_and_keeps_completed_results(self):
+    def test_observation_failure_does_not_write_partial_figures(self):
         config = replace(self.config, points=(self.point, replace(self.point, name='second')))
-        self.read_frames.side_effect = [(frame for frame in self.frames), ValueError('点位在网格外')]
+        self.read_cldas.side_effect = [
+            ValueError('CLDAS 文件读取失败'),
+        ]
         output, errors = StringIO(), StringIO()
         with patch('wrf_evaluate.cli.load_config', return_value=config), redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(main(['plot']), 2)
-        self.draw.assert_called_once()
-        self.assertIn('已生成 test:', output.getvalue())
-        self.assertIn('点位 second: 点位在网格外', errors.getvalue())
+        self.draw.assert_not_called()
+        self.assertIn('CLDAS 文件读取失败', errors.getvalue())
 
     def test_missing_configuration_or_unsupported_source_fails_before_reading(self):
         national = replace(self.station, kind='national')
@@ -251,3 +254,101 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.assertIn('3 个原生时次，2 个有效值', output.getvalue())
         self.assertIn('temperature_2m_001_test_', output.getvalue())
         self.assertIn('指标:', output.getvalue())
+        text = output.getvalue()
+        self.assertIn('加载检验与绘图模块', text)
+        self.assertIn('读取 WRF 来源', text)
+        self.assertLess(text.index('读取 WRF 来源'), text.index('已生成 test:'))
+
+    def test_latest_eligible_run_and_directory_precedence(self):
+        old = Path('wrf/2024122323/sample')
+        new = Path('wrf/2024122400/sample')
+        self.files['wrf'] = [new, old]
+        def read(path, *args, **kwargs):
+            return iter((tuple(replace(frame, path=path, model_start_time=self.time - timedelta(days=1),
+                                       values={'T2': 283.15 if path == new else 273.15})
+                               for _ in args[2]) for frame in self.frames))
+        self.read_frames.side_effect = read
+        source = replace(self.wrf, min_lead_hours=1)
+        result = _wrf_series(source, replace(self.config, sources=(source,)))['test', 'temperature_2m']
+        self.assertEqual(result.series.values, (0, 10))
+        self.assertEqual(len(result.runs), 2)
+        self.assertEqual(self.read_frames.call_args.kwargs['min_lead_hours'], 1)
+
+    def test_cumulative_difference_stays_inside_run_and_lead_window(self):
+        old = Path('wrf/2024122322/sample')
+        new = Path('wrf/2024122323/sample')
+        self.files['wrf'] = [old, new]
+        def read(path, *args, **kwargs):
+            values = (100, 102, 104) if path == old else (1, 4, 8)
+            return iter((WrfPointFrame(path, i, self.time + timedelta(hours=i), 0, 0, 0,
+                                       {'RAINNC': value}, {'RAINNC': 'mm'}),)
+                        for i, value in enumerate(values))
+        self.read_frames.side_effect = read
+        source = replace(self.wrf, min_lead_hours=2, variable_mapping=(
+            ('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),))
+        config = replace(self.config, sources=(source,), elements=('precipitation',),
+                         period=PeriodConfig(self.time, self.time + timedelta(hours=2)))
+        result = _wrf_series(source, config)['test', 'precipitation']
+        self.assertEqual(result.series.values, (2, 4))
+        observed = Series('obs', (self.time + timedelta(hours=2),), (4,),
+                          ((self.time, self.time + timedelta(hours=2)),), 'sum', 'mm')
+        comparison, = compare_forecast(result, observed, timedelta(0), 'precipitation')
+        self.assertEqual(comparison.metrics.mae, 0)  # 新批次不能完整覆盖窗口，使用旧批次的 2+2。
+
+
+class ForecastSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.time = datetime(2024, 12, 24, tzinfo=timezone.utc)
+        self.source = SourceConfig('wrf', 'wrf', Path('wrf'), ('*',), 'UTC', True)
+
+    def test_lead_configuration_defaults_and_invalid_values(self):
+        text = b'[sources.wrf]\nkind="wrf"\nroot="raw"\npatterns=["*"]\ntimezone="UTC"\n'
+        with patch.object(Path, 'is_dir', return_value=True), patch.object(Path, 'exists', return_value=False):
+            for value, expected in ((b'', 0), (b'min_lead_hours=1.5\n', 1.5)):
+                with patch.object(Path, 'read_bytes', return_value=text + value):
+                    self.assertEqual(load_config('config.toml').sources[0].min_lead_hours, expected)
+            for value in (b'-1', b'nan', b'inf', b'true', b'"6"'):
+                with self.subTest(value=value), patch.object(Path, 'read_bytes', return_value=text + b'min_lead_hours=' + value):
+                    with self.assertRaises(ConfigError):
+                        load_config('config.toml')
+
+    def test_directory_timezone_root_and_file_attribute_fallback(self):
+        source = replace(self.source, timezone='Asia/Shanghai')
+        self.assertEqual(forecast_init_time(source, Path('wrf/2024122408/nested/file')), self.time)
+        self.assertEqual(forecast_init_time(replace(source, root=Path('wrf/2024122408')),
+                                            Path('wrf/2024122408/file')), self.time)
+        self.assertEqual(forecast_init_time(source, Path('wrf/file'), self.time), self.time)
+        self.assertEqual(forecast_init_time(replace(source, init_time=self.time), Path('wrf/file')), self.time)
+        self.assertIsNone(forecast_init_time(source, Path('wrf/file')))
+        with self.assertRaisesRegex(ValueError, 'min_lead_hours'):
+            forecast_init_time(replace(source, min_lead_hours=1), Path('wrf/file'))
+        with self.assertRaisesRegex(ValueError, '多个'):
+            forecast_init_time(source, Path('wrf/2024122408/2024122409/file'))
+
+    def test_latest_missing_value_does_not_fall_back_to_old_run(self):
+        times = (self.time, self.time + timedelta(hours=1))
+        old = Series('wrf', times, (1, 2))
+        new = Series('wrf', times, (None, 3))
+        result = select_latest([(self.time, new), (self.time - timedelta(hours=1), old)])
+        self.assertEqual(result.series.values, (None, 3))
+
+    def test_lead_cutoff_requires_entire_interval_and_includes_boundary(self):
+        end = self.time + timedelta(hours=1)
+        instant = Series('wrf', (self.time, end), (1, 2))
+        self.assertEqual(eligible_series(instant, self.time).values, (1, 2))
+        rain = Series('wrf', (self.time, end), (1, 2),
+                      ((self.time - timedelta(hours=1), self.time), (self.time, end)), 'sum', 'mm')
+        self.assertEqual(eligible_series(rain, self.time).values, (2,))
+
+    def test_latest_complete_interval_with_missing_does_not_fall_back(self):
+        end = self.time + timedelta(hours=1)
+        bounds = ((self.time, end),)
+        old = Series('wrf', (end,), (1,), bounds, 'sum', 'mm')
+        new = Series('wrf', (end,), (None,), bounds, 'sum', 'mm')
+        # 另一个有效时次使绘图序列非全缺测。
+        new = Series('wrf', (end, end + timedelta(hours=1)), (None, 1),
+                     bounds + ((end, end + timedelta(hours=1)),), 'sum', 'mm')
+        result = select_latest([(self.time - timedelta(hours=1), old), (self.time, new)])
+        comparison, = compare_forecast(result, old, timedelta(0), 'precipitation')
+        self.assertEqual(comparison.matched_times, 1)
+        self.assertEqual(comparison.metrics.sample_count, 0)

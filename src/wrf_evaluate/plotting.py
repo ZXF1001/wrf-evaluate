@@ -13,6 +13,14 @@ from .config import DEFAULT_DISPLAY_NAMES, PeriodConfig, PointConfig
 from .series import Series
 
 
+def plot_style() -> dict:
+    """曲线图与空间图共用中文字体设置。"""
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    preferred = ("Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "WenQuanYi Zen Hei")
+    fonts = [name for name in preferred if name in available] + ["DejaVu Sans"]
+    return {"font.family": fonts, "font.size": 10}
+
+
 def plot_series(
     path: str | Path, point: PointConfig, series: Sequence[Series], timezone: str,
     *, period: PeriodConfig | None = None,
@@ -33,10 +41,7 @@ def plot_series(
     path = Path(path)
     if path.suffix.lower() != ".png":
         raise ValueError("输出路径须以 .png 结尾")
-    available = {font.name for font in font_manager.fontManager.ttflist}
-    preferred = ("Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "WenQuanYi Zen Hei")
-    fonts = [name for name in preferred if name in available] + ["DejaVu Sans"]
-    with rc_context({"font.family": fonts, "font.size": 10}):
+    with rc_context(plot_style()):
         figure = Figure(figsize=(11, 4.8), layout="constrained")
         FigureCanvasAgg(figure)
         ax = figure.subplots()

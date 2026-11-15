@@ -1,8 +1,9 @@
 """只读 WRF 文件；先读时间和元数据，再按需读取单时刻二维变量。"""
 
 from collections.abc import Iterator, Sequence
+from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -59,6 +60,7 @@ class WrfPointFrame:
     distance_km: float
     values: dict[str, float | None]
     units: dict[str, str]
+    model_start_time: datetime | None = None
 
 
 def _read_times(dataset: Dataset, zone: ZoneInfo) -> tuple[datetime, ...]:
@@ -85,6 +87,14 @@ def _read_times(dataset: Dataset, zone: ZoneInfo) -> tuple[datetime, ...]:
     return times
 
 
+def _model_start_time(dataset: Dataset, zone: ZoneInfo) -> datetime | None:
+    start = getattr(dataset, "SIMULATION_START_DATE", getattr(dataset, "START_DATE", None))
+    try:
+        return datetime.strptime(start, "%Y-%m-%d_%H:%M:%S").replace(tzinfo=zone) if start else None
+    except (ValueError, TypeError) as exc:
+        raise WrfReadError("模式起始时间属性格式错误") from exc
+
+
 def read_wrf_header(path: str | Path, timezone: str = "UTC") -> WrfHeader:
     """只读取 WRF 时间、维度和变量名，不加载变量网格。"""
     path = Path(path)
@@ -96,11 +106,7 @@ def read_wrf_header(path: str | Path, timezone: str = "UTC") -> WrfHeader:
     try:
         with Dataset(path, mode="r") as dataset:
             times = _read_times(dataset, zone)
-            start = getattr(dataset, "SIMULATION_START_DATE", getattr(dataset, "START_DATE", None))
-            try:
-                model_start_time = datetime.strptime(start, "%Y-%m-%d_%H:%M:%S").replace(tzinfo=zone) if start else None
-            except (ValueError, TypeError) as exc:
-                raise WrfReadError("模式起始时间属性格式错误") from exc
+            model_start_time = _model_start_time(dataset, zone)
             dimensions = tuple((name, len(dimension)) for name, dimension in dataset.dimensions.items())
             variables = frozenset(dataset.variables)
     except (WrfReadError, OSError) as exc:
@@ -197,16 +203,17 @@ def _locate_point(longitude: float, latitude: float, grid_longitude: np.ndarray,
     return point
 
 
-def iter_wrf_point_frames(
+def iter_wrf_points_frames(
     path: str | Path,
     names: Sequence[str],
     timezone: str,
-    longitude: float,
-    latitude: float,
+    points: Sequence[tuple[float, float]],
     *,
     period: PeriodConfig | None = None,
-) -> Iterator[WrfPointFrame]:
-    """一次打开文件，按原生时次返回单点值，不加载气象变量的整幅网格。
+    init_time: datetime | None = None,
+    min_lead_hours: float = 0,
+) -> Iterator[tuple[WrfPointFrame, ...]]:
+    """一次打开文件，按时次返回所有点位值；坐标读取与定位结果复用。
 
     每帧检查坐标；坐标未变时复用定位，移动网格重新定位。提前停止遍历时
     须 close() 此生成器或使用 contextlib.closing，保证文件及时关闭。
@@ -214,6 +221,8 @@ def iter_wrf_point_frames(
     """
     path = Path(path)
     _validate_names(names)
+    if not points:
+        raise WrfReadError("points 须至少包含一个经纬度点位")
     if any(name in {"XLAT", "XLONG"} for name in names):
         raise WrfReadError("names 不应包含坐标变量 XLAT/XLONG")
     try:
@@ -224,6 +233,15 @@ def iter_wrf_point_frames(
     try:
         with Dataset(path, mode="r") as dataset:
             times = _read_times(dataset, zone)
+            if period is not None and not any(period.start <= time <= period.end for time in times):
+                return
+            model_start_time = _model_start_time(dataset, zone)
+            run_start = init_time or model_start_time
+            if min_lead_hours < 0:
+                raise WrfReadError("min_lead_hours 须为非负数")
+            if min_lead_hours and run_start is None:
+                raise WrfReadError("min_lead_hours 需要 WRF 文件内或配置中的起报时间")
+            valid_start = run_start + timedelta(hours=min_lead_hours) if run_start else None
             for name in ("XLAT", "XLONG", *names):
                 variable = _ground_variable(dataset, name)
                 if variable.shape[0] != len(times):
@@ -234,6 +252,8 @@ def iter_wrf_point_frames(
             for time_index, time in enumerate(times):
                 if period is not None and not period.start <= time <= period.end:
                     continue
+                if valid_start is not None and time < valid_start:
+                    continue
                 grid = tuple(np.ma.masked_invalid(dataset.variables[name][time_index, :, :], copy=False)
                              for name in ("XLONG", "XLAT"))
                 # 精确比较坐标及掩码，不以宽松容差忽略实际网格移动。
@@ -243,14 +263,44 @@ def iter_wrf_point_frames(
                     for current, previous in zip(grid, previous_grid)
                 )
                 if not same_grid:
-                    point = _locate_point(longitude, latitude, *grid)
+                    locations = []
+                    for longitude, latitude in points:
+                        try:
+                            locations.append(_locate_point(longitude, latitude, *grid))
+                        except WrfReadError as exc:
+                            raise WrfReadError(f"点位 ({longitude:g}, {latitude:g}): {exc}") from exc
                 previous_grid = grid
-                values = {}
-                for name in names:
-                    value = dataset.variables[name][time_index, point.row, point.column]
-                    values[name] = None if np.ma.is_masked(value) or not np.isfinite(value) else float(value)
-                yield WrfPointFrame(
-                    path, time_index, time, point.row, point.column, point.distance_km, values, units.copy(),
+                # 单点索引避免 netCDF4 多个索引数组产生笛卡尔积；重复格点只读一次。
+                samples = {}
+                for point in locations:
+                    key = point.row, point.column
+                    if key not in samples:
+                        values = {}
+                        for name in names:
+                            value = dataset.variables[name][time_index, point.row, point.column]
+                            values[name] = None if np.ma.is_masked(value) or not np.isfinite(value) else float(value)
+                        samples[key] = values
+                yield tuple(
+                    WrfPointFrame(path, time_index, time, point.row, point.column, point.distance_km,
+                                  samples[point.row, point.column], units, model_start_time)
+                    for point in locations
                 )
     except (WrfReadError, OSError) as exc:
         raise WrfReadError(f"无法读取 WRF 文件 {path}: {exc}") from exc
+
+
+def iter_wrf_point_frames(
+    path: str | Path,
+    names: Sequence[str],
+    timezone: str,
+    longitude: float,
+    latitude: float,
+    *,
+    period: PeriodConfig | None = None,
+) -> Iterator[WrfPointFrame]:
+    """单点读取接口；多点批处理请使用 iter_wrf_points_frames。"""
+    with closing(iter_wrf_points_frames(
+        path, names, timezone, ((longitude, latitude),), period=period,
+    )) as frames:
+        for batch in frames:
+            yield batch[0]

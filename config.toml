@@ -22,6 +22,10 @@ end = "2024-12-24T14:00:00+08:00"
 [matching]
 time_tolerance_seconds = 60  # 瞬时指标最近时刻一对一配对；时段量比较完整相同区间；绘图不重采样
 
+[maps]
+# 空间填色图使用 period 的起止时间，从 start 起每隔该时长输出一组图。
+interval = "6h"
+
 [metrics]
 # 雨量 >= 阈值即事件，单位 mm。填写业务阈值后使用；空数组表示不计算降水事件率。
 # 仅比较同一起止时段的雨量；不将不同时长的事件混合统计。
@@ -40,6 +44,11 @@ kind = "wrf"
 root = "F:/Data/example/WRF"
 patterns = ["wrfout_d03*"]
 timezone = "UTC"
+# 自动递归查找 root 下的文件；yyyymmddhh 目录名按此 timezone 作为起报时间。
+# 平铺文件回退读取 SIMULATION_START_DATE，缺少时读取 START_DATE；无需逐文件填写。
+min_lead_hours = 0  # 默认 0；例如设为 6，排除 lead time < 6h，6h 端点保留
+# 仅目录和文件属性均不能表示业务起报时，可显式覆盖平铺文件：
+# init_time = "2024-12-23T12:00:00Z"
 
 [sources.wrf.variables]
 # 左侧固定为统一要素英文名；variable 只指定一个 NetCDF 字段。
