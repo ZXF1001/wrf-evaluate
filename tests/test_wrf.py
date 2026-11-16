@@ -1,6 +1,7 @@
 """Exercise WRF NetCDF reading with small temporary files."""
 
 from contextlib import closing, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -13,9 +14,10 @@ from netCDF4 import Dataset, stringtochar
 
 from wrf_evaluate.cli import main
 from wrf_evaluate.spatial import nearest_grid_point
-from wrf_evaluate.config import PeriodConfig
+from wrf_evaluate.config import Config, PeriodConfig, PointConfig, SourceConfig
+from wrf_evaluate.workflow import _wrf_series
 from wrf_evaluate.wrf import (
-    WrfField, WrfReadError, iter_wrf_point_frames, iter_wrf_points_frames, read_wrf_field,
+    WrfField, WrfFieldReader, WrfPointLocator, WrfReadError, iter_wrf_point_frames, iter_wrf_points_frames, read_wrf_field,
     read_wrf_fields, read_wrf_header, resolve_wrf_variable, sample_wrf_station,
 )
 from wrf_evaluate.variables import VariableConfig
@@ -113,6 +115,43 @@ class WrfReaderTests(unittest.TestCase):
             with self.subTest(names=names), self.assertRaises(WrfReadError):
                 read_wrf_fields(self.path, names)
 
+    def test_map_reader_reuses_fields_and_releases_previous_file_and_frame(self):
+        self.add_coordinates()
+        second = self.root / 'second'
+        second.write_bytes(self.path.read_bytes())
+        with patch('wrf_evaluate.wrf.Dataset', wraps=Dataset) as opened:
+            with closing(WrfFieldReader()) as reader:
+                first = reader.read(self.path, ('T2', 'XLONG'), 0)
+                same = reader.read(self.path, ('T2', 'XLONG', 'XLAT'), 0)
+                self.assertIs(first['T2'], same['T2'])
+                self.assertIs(first['XLONG'], same['XLONG'])
+                self.assertEqual(opened.call_count, 1)
+                next_frame = reader.read(self.path, ('T2',), 1)
+                self.assertEqual(next_frame['T2'].values[0, 0], 274)
+                self.assertTrue(next_frame['T2'].values.mask[0, 1])
+                self.assertEqual(set(reader.fields), {'T2'})
+                self.assertEqual(opened.call_count, 1)
+                first_dataset = reader.dataset
+                other = reader.read(second, ('T2',), 0)
+                self.assertFalse(first_dataset.isopen())
+                self.assertIsNot(other['T2'], first['T2'])
+                self.assertEqual(opened.call_count, 2)
+                last_dataset = reader.dataset
+            self.assertFalse(last_dataset.isopen())
+            self.assertEqual(reader.fields, {})
+
+    def test_map_reader_closes_file_on_invalid_request_and_drawing_failure(self):
+        reader = WrfFieldReader()
+        with self.assertRaisesRegex(WrfReadError, '缺少变量'):
+            reader.read(self.path, ('T2', 'missing'))
+        self.assertIsNone(reader.dataset)
+        with self.assertRaisesRegex(RuntimeError, 'draw failed'):
+            with closing(reader):
+                reader.read(self.path, ('T2',))
+                dataset = reader.dataset
+                raise RuntimeError('draw failed')
+        self.assertFalse(dataset.isopen())
+
     def test_nearest_grid_station_sample_returns_values_and_keeps_missing(self):
         with Dataset(self.path, "a") as dataset:
             latitude = dataset.createVariable("XLAT", "f4", ("Time", "south_north", "west_east"))
@@ -189,6 +228,25 @@ class WrfReaderTests(unittest.TestCase):
         self.assertEqual(frames[0].time, period.end)
         locate.assert_called_once()
 
+    def test_locator_reuses_across_files_and_relocates_changed_grid(self):
+        self.add_coordinates()
+        second = self.root / 'second'
+        second.write_bytes(self.path.read_bytes())
+        points = ((87.01, 43.01), (87.01, 43.01))
+        locator = WrfPointLocator(points)
+        with patch('wrf_evaluate.wrf.nearest_grid_point', wraps=nearest_grid_point) as locate:
+            for path in (self.path, second):
+                frames = list(iter_wrf_points_frames(path, ['T2'], 'UTC', points, locator=locator))
+                self.assertEqual([frame.column for frame in frames[0]], [0, 0])
+            self.assertEqual(locate.call_count, 1)
+            with Dataset(second, 'a') as dataset:
+                dataset.variables['XLONG'][:] = [[86, 87, 88], [86, 87, 88]]
+            frames = list(iter_wrf_points_frames(second, ['T2'], 'UTC', points, locator=locator))
+            self.assertEqual([frame.column for frame in frames[0]], [1, 1])
+            self.assertEqual(locate.call_count, 2)
+        with self.assertRaisesRegex(WrfReadError, '点位列表'):
+            list(iter_wrf_points_frames(second, ['T2'], 'UTC', ((88., 43.),), locator=locator))
+
     def test_point_frames_exclude_times_after_maximum_forecast_lead(self):
         self.add_coordinates()
         init_time = datetime(2024, 12, 23, 22, tzinfo=timezone.utc)
@@ -197,6 +255,38 @@ class WrfReaderTests(unittest.TestCase):
             init_time=init_time, max_lead_hours=0.01,
         ))
         self.assertEqual([frame.time_index for frame in frames], [0])
+
+    def test_hourly_rain_across_files_keeps_period_and_lead_boundaries(self):
+        self.add_coordinates()
+        start = datetime(2024, 12, 24, tzinfo=timezone.utc)
+        for hour in (-1, 0, 1, 2):
+            time = start + timedelta(hours=hour)
+            path = self.root / f'wrfout_d03_{time:%Y-%m-%d_%H_%M_%S}.nc'
+            path.write_bytes(self.path.read_bytes())
+            with Dataset(path, 'a') as dataset:
+                dataset.SIMULATION_START_DATE = '2024-12-24_00:00:00'
+                times = dataset.variables['Times']
+                times.set_auto_chartostring(False)
+                times[:] = stringtochar(np.array([
+                    (time + timedelta(minutes=m)).strftime('%Y-%m-%d_%H:%M:%S')
+                    for m in (0, 30)
+                ], dtype='S19'))
+                rain = dataset.createVariable('RAINNC', 'f4', ('Time', 'south_north', 'west_east'))
+                rain.units = 'mm'
+                rain[0], rain[1] = 100 + hour * 2, 101 + hour * 2
+        source = SourceConfig('wrf', 'wrf', self.root, ('*.nc',), 'UTC', True,
+                              variable_mapping=(('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),))
+        config = Config((source,), self.root / 'unused', 'UTC', timedelta(0),
+                        points=(PointConfig('test', 87.01, 43.01),), elements=('precipitation',),
+                        period=PeriodConfig(start, start + timedelta(hours=2)))
+        with patch('wrf_evaluate.wrf.Dataset', wraps=Dataset) as opened:
+            forecast = _wrf_series(source, config)['test', 'precipitation']
+        self.assertEqual(opened.call_count, 3)  # Filename filtering excludes the previous hour.
+        self.assertEqual(forecast.series.values, (2, 2))
+        self.assertEqual(forecast.series.bounds[0], (start, start + timedelta(hours=1)))
+        forecast = _wrf_series(replace(source, min_lead_hours=1), config)['test', 'precipitation']
+        self.assertEqual(forecast.series.values, (2,))
+        self.assertEqual(forecast.series.bounds[0][0], start + timedelta(hours=1))
 
     def test_point_frames_keep_missing_values_and_relocate_moving_grid(self):
         self.add_coordinates()

@@ -1,6 +1,7 @@
 """按配置时间绘制 WRF/CLDAS 空间场；仅加载当前比较所需的场。"""
 
 from collections.abc import Callable
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
@@ -17,7 +18,7 @@ from .forecasts import run_order, valid_from
 from .matching import iter_cldas_input_files
 from .plotting import plot_style
 from .variables import UNITS, VariableConfig, convert_value, relative_humidity
-from .wrf import read_wrf_fields, resolve_wrf_variable
+from .wrf import WrfFieldReader, read_wrf_fields, resolve_wrf_variable
 
 
 GridField = tuple[np.ndarray, np.ndarray, np.ma.MaskedArray]
@@ -55,6 +56,7 @@ def _statistic(field: str, spec: VariableConfig) -> str:
 def _forecast_field(
     frames: FrameIndex, field: str, spec: VariableConfig, start: datetime, end: datetime,
     progress: Callable[[str], None] | None = None,
+    reader: WrfFieldReader | None = None,
 ) -> GridField | None:
     """完整连续覆盖目标窗口；累计量逐时次检查差分，拒绝清零和移动网格。"""
     if start == end:
@@ -84,7 +86,8 @@ def _forecast_field(
             progress(f"读取空间场 {field}：{frame_index}/{len(selected)} 个时次")
             last_report = now
         path, index = frames[time]
-        fields = read_wrf_fields(path, (*spec.native_variables, "XLONG", "XLAT"), index)
+        read = reader.read if reader is not None else read_wrf_fields
+        fields = read(path, (*spec.native_variables, "XLONG", "XLAT"), index)
         coordinates = fields["XLONG"].values, fields["XLAT"].values
         if any(np.ma.getmaskarray(axis).any() for axis in coordinates):
             raise ValueError(f"{path}: 空间图坐标含缺测")
@@ -144,6 +147,7 @@ def _observation_field(files, spec, field, header, selection, timezone):
 def _latest_field(
     runs: RunIndex, source: SourceConfig, field: str, spec: VariableConfig,
     start: datetime, end: datetime, progress: Callable[[str], None],
+    reader: WrfFieldReader | None = None,
 ) -> tuple[datetime | None, GridField] | None:
     for init_time, frames in sorted(runs.items(), key=lambda item: run_order(item[0]), reverse=True):
         cutoff = valid_from(source, init_time)
@@ -151,7 +155,7 @@ def _latest_field(
             continue
         if init_time is not None and end > init_time + timedelta(hours=source.max_lead_hours):
             continue
-        result = _forecast_field(frames, field, spec, start, end, progress)
+        result = _forecast_field(frames, field, spec, start, end, progress, reader)
         if result is not None:
             return init_time, result
     return None
@@ -191,70 +195,72 @@ def plot_maps(
     if not cldas_sources:
         progress("未启用 CLDAS，跳过空间对比图")
         return
-    input_files = {
-        (source.name, field, family, time): files
-        for source in cldas_sources.values() for field in config.elements
-        if (spec := source.variable(field)) is not None
-        for family, time, files in iter_cldas_input_files(source.name, spec, cldas_index)
-    }
+    plans = {}
+    for source in cldas_sources.values():
+        for field in config.elements:
+            spec = source.variable(field)
+            if spec is None:
+                continue
+            for _, time, files in iter_cldas_input_files(source.name, spec, cldas_index):
+                if (config.period.start <= time <= config.period.end
+                        and (time - config.period.start) % config.map_interval == timedelta(0)):
+                    plans.setdefault((time, field), []).append((source, files))
     count = skipped = 0
     time = config.period.start
-    while time <= config.period.end:
-        for field in config.elements:
-            found = False
-            for (source_name, family, product), (times, files) in sorted(cldas_index.items()):
-                source = cldas_sources[source_name]
-                spec = source.variable(field)
-                if spec is None or spec.source_inputs[0][1].product != product or time not in times:
-                    continue
-                found = True
-                files_by_role = input_files[source_name, field, family, time]
-                if any(info is None for info in files_by_role.values()):
-                    progress(f"跳过空间图 {field} {time.isoformat()}：缺少同一系列、同刻湿度基础产品")
-                    skipped += 1
-                    continue
-                start, end = _window(time, spec)
-                if start < config.period.start or end > config.period.end:
-                    progress(f"跳过空间图 {field} {time.isoformat()}：完整时段超出 period")
-                    skipped += 1
-                    continue
-                info = files[times.index(time)]
-                header = read_cldas_header(info.path, source.timezone)
-                for wrf in wrf_sources:
-                    wrf_spec = wrf.variable(field)
-                    if wrf_spec is None:
-                        continue
-                    if _statistic(field, wrf_spec) != _statistic(field, spec):
-                        raise ValueError(f"空间图 {field}: WRF/CLDAS 时间含义不同，不能直接并排比较")
-                    progress(f"绘制空间图 {field} {time.isoformat()}：{wrf.name} / {source_name}")
-                    selected = _latest_field(indices[wrf.name], wrf, field, wrf_spec, start, end, progress)
-                    if selected is None:
-                        progress("跳过：WRF 缺少严格对应的时次或完整时段")
+    with closing(WrfFieldReader()) as reader:
+        while time <= config.period.end:
+            for field in config.elements:
+                found = False
+                for source, files_by_role in plans.get((time, field), ()):
+                    source_name = source.name
+                    spec = source.variable(field)
+                    found = True
+                    if any(info is None for info in files_by_role.values()):
+                        progress(f"跳过空间图 {field} {time.isoformat()}：缺少同一系列、同刻湿度基础产品")
                         skipped += 1
                         continue
-                    init_time, forecast = selected
-                    lon, lat, value = forecast
-                    extent = (float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max()))
-                    columns = _crop_axis(header.longitudes, *extent[:2])
-                    rows = _crop_axis(header.latitudes, *extent[2:])
-                    observed = _observation_field(files_by_role, spec, field, header,
-                                                  (rows, columns), source.timezone)
-                    if field.startswith("surface_") and spec.time_kind == "sum":
-                        observed = observed / (end - start).total_seconds()
-                    observation = header.longitudes[columns], header.latitudes[rows], observed
-                    label = f"{time.astimezone(zone):%Y-%m-%d %H:%M:%S}（{config.display_timezone}）"
-                    if start != end:
-                        label = f"{start.astimezone(zone):%Y-%m-%d %H:%M:%S} 至 {end.astimezone(zone):%Y-%m-%d %H:%M:%S}（{config.display_timezone}）"
-                    title = f"{config.display_name(field)}空间对比\n{label}"
-                    count += 1
-                    path = Path(output_dir) / f"map_{field}_{time.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}_{count:04d}.png"
-                    source_label = wrf.name
-                    if init_time is not None:
-                        source_label += f"（起报 {init_time.astimezone(zone):%Y-%m-%d %H:%M}）"
-                    _draw(path, forecast, observation, extent, title, source_label, config.display_name(field), UNITS[field])
-                    progress(f"已生成空间图：{path.name}")
-            if not found:
-                skipped += 1
-                progress(f"跳过空间图 {field} {time.isoformat()}：没有对应 CLDAS 产品/时次")
-        time += config.map_interval
+                    start, end = _window(time, spec)
+                    if start < config.period.start or end > config.period.end:
+                        progress(f"跳过空间图 {field} {time.isoformat()}：完整时段超出 period")
+                        skipped += 1
+                        continue
+                    info = files_by_role[spec.source_inputs[0][0]]
+                    header = read_cldas_header(info.path, source.timezone)
+                    for wrf in wrf_sources:
+                        wrf_spec = wrf.variable(field)
+                        if wrf_spec is None:
+                            continue
+                        if _statistic(field, wrf_spec) != _statistic(field, spec):
+                            raise ValueError(f"空间图 {field}: WRF/CLDAS 时间含义不同，不能直接并排比较")
+                        progress(f"绘制空间图 {field} {time.isoformat()}：{wrf.name} / {source_name}")
+                        selected = _latest_field(indices[wrf.name], wrf, field, wrf_spec, start, end, progress, reader)
+                        if selected is None:
+                            progress("跳过：WRF 缺少严格对应的时次或完整时段")
+                            skipped += 1
+                            continue
+                        init_time, forecast = selected
+                        lon, lat, value = forecast
+                        extent = (float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max()))
+                        columns = _crop_axis(header.longitudes, *extent[:2])
+                        rows = _crop_axis(header.latitudes, *extent[2:])
+                        observed = _observation_field(files_by_role, spec, field, header,
+                                                      (rows, columns), source.timezone)
+                        if field.startswith("surface_") and spec.time_kind == "sum":
+                            observed = observed / (end - start).total_seconds()
+                        observation = header.longitudes[columns], header.latitudes[rows], observed
+                        label = f"{time.astimezone(zone):%Y-%m-%d %H:%M:%S}（{config.display_timezone}）"
+                        if start != end:
+                            label = f"{start.astimezone(zone):%Y-%m-%d %H:%M:%S} 至 {end.astimezone(zone):%Y-%m-%d %H:%M:%S}（{config.display_timezone}）"
+                        title = f"{config.display_name(field)}空间对比\n{label}"
+                        count += 1
+                        path = Path(output_dir) / f"map_{field}_{time.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}_{count:04d}.png"
+                        source_label = wrf.name
+                        if init_time is not None:
+                            source_label += f"（起报 {init_time.astimezone(zone):%Y-%m-%d %H:%M}）"
+                        _draw(path, forecast, observation, extent, title, source_label, config.display_name(field), UNITS[field])
+                        progress(f"已生成空间图：{path.name}")
+                if not found:
+                    skipped += 1
+                    progress(f"跳过空间图 {field} {time.isoformat()}：没有对应 CLDAS 产品/时次")
+            time += config.map_interval
     progress(f"空间图完成：生成 {count} 张，跳过 {skipped} 组")

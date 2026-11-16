@@ -127,14 +127,12 @@ time_kind = "mean"
 interval = "10min"
 timestamp = "end"
 
-# 降水需先核实 Excel 列的业务含义，再取消注释并明确配置：
-# 若仅先检验 WRF/CLDAS 降水，区域站可设 enabled = false，避免使用未确认语义。
-# [sources.regional.variables.precipitation]
-# variable = "小时降水量(mm)"
-# units = "mm"
-# time_kind = "sum"       # 已是单个时段雨量；连续累计读数用 cumulative，逐小时清零另需处理
-# interval = "1h"         # sum 必填：该值代表的时段长度
-# timestamp = "end"       # sum 必填：时间戳是该时段起点还是终点
+# 把 precipitation 加入顶部 elements 后，区域站默认按原始记录作图，不参与站点降水指标。
+# 只有确认 Excel 记录的雨量窗口后，才设 time_kind = "sum" 并补齐 interval、timestamp。
+[sources.regional.variables.precipitation]
+variable = "小时降水量(mm)"
+units = "mm"
+time_kind = "raw"  # 按原值绘图，不做差分；不假设区间，不参与站点降水指标
 
 # 未来可加入 EC 或更多 WRF 试验；名称自定，kind 表示数据类型。
 # 暂不使用的来源可设置 enabled = false，此时不检查其目录。

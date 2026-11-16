@@ -1,7 +1,7 @@
-"""点位序列的单位与时间区间标准化；不修改来源数据、不做重采样。"""
+"""点位序列的单位、时间区间标准化与逐小时雨量合成；不修改来源数据。"""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 
 from .variables import UNITS, VariableConfig, convert_value, validate_variable
@@ -27,11 +27,11 @@ class Series:
             raise ValueError(f"{self.label}: 时间须严格递增，重复记录须先核实来源")
         if any(value is not None and (isinstance(value, bool) or not math.isfinite(value)) for value in self.values):
             raise ValueError(f"{self.label}: 数值须为有限值或 None")
-        if self.statistic not in {"instant", "mean", "sum"}:
-            raise ValueError("标准化后的统计方式应为 instant / mean / sum")
-        if self.statistic == "instant" and self.bounds:
-            raise ValueError("瞬时值不应含时段边界")
-        if self.statistic != "instant":
+        if self.statistic not in {"instant", "mean", "sum", "raw"}:
+            raise ValueError("标准化后的统计方式应为 instant / mean / sum / raw")
+        if self.statistic in {"instant", "raw"} and self.bounds:
+            raise ValueError("瞬时值或未分类原始值不应含时段边界")
+        if self.statistic not in {"instant", "raw"}:
             if len(self.bounds) != len(self.times):
                 raise ValueError("时段序列须为每个值保留起止边界")
             for start, end in self.bounds:
@@ -75,11 +75,12 @@ def normalize_series(
             if radiation_energy and value is not None:
                 value /= (end - start).total_seconds()
             # 时段量仅保留完整落入检验范围的区间，不能裁剪后仍使用完整区间值。
-            inside = period.start <= time <= period.end if statistic == "instant" else period.start <= start < end <= period.end
+            inside = (period.start <= time <= period.end if statistic in {"instant", "raw"}
+                      else period.start <= start < end <= period.end)
             if inside:
                 times.append(time)
                 values.append(value)
-                if statistic != "instant":
+                if statistic not in {"instant", "raw"}:
                     bounds.append((start, end))
         except ValueError as exc:
             raise ValueError(f"{label} {location}: {exc}") from exc
@@ -90,3 +91,45 @@ def normalize_series(
     if not allow_empty and all(value is None for value in values):
         raise ValueError(f"{label}: 配置时段内数值全部缺测")
     return Series(label, tuple(times), tuple(values), tuple(bounds), statistic, UNITS[field])
+
+
+def hourly_precipitation(curve: Series) -> Series | None:
+    """单一起报内的雨量汇为整点结束的一小时量；不拆分区间，不补缺测。"""
+    if curve.statistic != "sum" or curve.unit != "mm":
+        raise ValueError("逐小时降水需要已差分或已定义区间的 mm 雨量")
+    bounds = tuple((a.astimezone(timezone.utc), b.astimezone(timezone.utc)) for a, b in curve.bounds)
+    exact = dict(zip(bounds, curve.values))
+    by_start = {start: (end, value) for (start, end), value in zip(bounds, curve.values)}
+    can_sum = all(a[1] <= b[0] for a, b in zip(bounds, bounds[1:]))
+    hour = timedelta(hours=1)
+    start = bounds[0][0].replace(minute=0, second=0, microsecond=0)
+    if start < bounds[0][0]:
+        start += hour
+    periods, values = [], []
+    while start + hour <= bounds[-1][1]:
+        end = start + hour
+        if (start, end) in exact:
+            value = exact[start, end]
+        elif can_sum:
+            cursor, parts = start, []
+            while cursor < end:
+                item = by_start.get(cursor)
+                if item is None or item[0] > end:
+                    break
+                cursor, value = item
+                parts.append(value)
+            if cursor != end:
+                start = end
+                continue
+            value = None if any(part is None for part in parts) else sum(parts)
+        else:
+            start = end
+            continue
+        periods.append((start, end))
+        values.append(value)
+        start = end
+    if not periods:
+        return None
+    label = curve.label if curve.label.endswith("（逐小时雨量）") else f"{curve.label}（逐小时雨量）"
+    return Series(label, tuple(end for _, end in periods),
+                  tuple(values), tuple(periods), "sum", "mm")

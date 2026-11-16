@@ -167,32 +167,63 @@ def _ground_variable(dataset: Dataset, name: str):
     return variable
 
 
-def read_wrf_fields(
-    path: str | Path, names: Sequence[str], time_index: int = 0,
-) -> dict[str, WrfField]:
-    """一次打开文件，读取指定时刻的多个二维地面场。
+class WrfFieldReader:
+    """空间图共用当前文件和当前帧；换文件立即关闭，换帧释放已读场。
 
-    仅保留所选变量的一个时次，不缓存文件句柄或加载其他时次。
-    返回值保留原单位和缺测掩码；不执行单位转换、降水合成或空间插值。
+    配合 contextlib.closing 使用。内存只保留一帧已请求的字段，
+    不预读其他变量、不落盘，返回数组不得被调用方原地修改。
     """
-    if not isinstance(time_index, int) or isinstance(time_index, bool) or time_index < 0:
-        raise WrfReadError("time_index 须为非负整数")
-    _validate_names(names)
-    try:
-        with Dataset(path, mode="r") as dataset:
+
+    def __init__(self):
+        self.path = None
+        self.dataset = None
+        self.time_index = None
+        self.fields: dict[str, WrfField] = {}
+
+    def close(self) -> None:
+        dataset, self.dataset = self.dataset, None
+        self.path = self.time_index = None
+        self.fields.clear()
+        if dataset is not None:
+            dataset.close()
+
+    def read(self, path: str | Path, names: Sequence[str], time_index: int = 0) -> dict[str, WrfField]:
+        if not isinstance(time_index, int) or isinstance(time_index, bool) or time_index < 0:
+            raise WrfReadError("time_index 须为非负整数")
+        _validate_names(names)
+        path = Path(path)
+        try:
+            if self.path != path:
+                self.close()
+                self.dataset = Dataset(path, mode="r")
+                self.path = path
+            dataset = self.dataset
             # 先核查全部请求，缺少某个变量时不先加载其他大数组。
             for name in names:
                 variable = _ground_variable(dataset, name)
                 if time_index >= variable.shape[0]:
                     raise WrfReadError(f"time_index={time_index} 超出 {name} 时间范围")
-            fields = {}
+            if self.time_index != time_index:
+                self.fields.clear()
+                self.time_index = time_index
             for name in names:
+                if name in self.fields:
+                    continue
                 variable = dataset.variables[name]
                 values = np.ma.masked_invalid(variable[time_index, :, :], copy=False)
-                fields[name] = WrfField(values, getattr(variable, "units", ""))
-            return fields
-    except (WrfReadError, OSError) as exc:
-        raise WrfReadError(f"无法读取 WRF 文件 {path}: {exc}") from exc
+                self.fields[name] = WrfField(values, getattr(variable, "units", ""))
+            return {name: self.fields[name] for name in names}
+        except (WrfReadError, OSError) as exc:
+            self.close()
+            raise WrfReadError(f"无法读取 WRF 文件 {path}: {exc}") from exc
+
+
+def read_wrf_fields(
+    path: str | Path, names: Sequence[str], time_index: int = 0,
+) -> dict[str, WrfField]:
+    """一次打开并关闭文件，读取指定时刻的二维地面场，保留原单位和缺测。"""
+    with closing(WrfFieldReader()) as reader:
+        return reader.read(path, names, time_index)
 
 
 def sample_wrf_station(
@@ -228,6 +259,34 @@ def _locate_point(longitude: float, latitude: float, grid_longitude: np.ndarray,
     return point
 
 
+class WrfPointLocator:
+    """本次读取复用上一帧定位；跨文件仍逐帧核对坐标，不假定网格固定。"""
+
+    def __init__(self, points: Sequence[tuple[float, float]]):
+        self.points = tuple(points)
+        self.grid = None
+        self.locations = ()
+
+    def locate(self, grid: tuple[np.ma.MaskedArray, ...]) -> tuple[GridPoint, ...]:
+        same_grid = self.grid is not None and all(
+            np.array_equal(current.data, previous.data)
+            and np.array_equal(np.ma.getmaskarray(current), np.ma.getmaskarray(previous))
+            for current, previous in zip(grid, self.grid, strict=True)
+        )
+        if not same_grid:
+            locations = {}
+            for longitude, latitude in self.points:
+                key = longitude, latitude
+                if key not in locations:
+                    try:
+                        locations[key] = _locate_point(longitude, latitude, *grid)
+                    except WrfReadError as exc:
+                        raise WrfReadError(f"点位 ({longitude:g}, {latitude:g}): {exc}") from exc
+            self.locations = tuple(locations[point] for point in self.points)
+            self.grid = grid
+        return self.locations
+
+
 def iter_wrf_points_frames(
     path: str | Path,
     names: Sequence[str],
@@ -238,10 +297,11 @@ def iter_wrf_points_frames(
     init_time: datetime | None = None,
     min_lead_hours: float = 0,
     max_lead_hours: float = 168,
+    locator: WrfPointLocator | None = None,
 ) -> Iterator[tuple[WrfPointFrame, ...]]:
     """一次打开文件，按时次返回所有点位值；坐标读取与定位结果复用。
 
-    每帧检查坐标；坐标未变时复用定位，移动网格重新定位。提前停止遍历时
+    每帧检查坐标；可传入同一 locator 跨文件复用定位，移动网格重新定位。提前停止遍历时
     须 close() 此生成器或使用 contextlib.closing，保证文件及时关闭。
     指定 period 时包含两个端点，范围外时次不读取坐标或气象场。
     """
@@ -249,6 +309,10 @@ def iter_wrf_points_frames(
     _validate_names(names)
     if not points:
         raise WrfReadError("points 须至少包含一个经纬度点位")
+    if locator is None:
+        locator = WrfPointLocator(points)
+    elif locator.points != tuple(points):
+        raise WrfReadError("复用定位的点位列表与本次读取不一致")
     if any(name in {"XLAT", "XLONG"} for name in names):
         raise WrfReadError("names 不应包含坐标变量 XLAT/XLONG")
     try:
@@ -271,36 +335,25 @@ def iter_wrf_points_frames(
                 raise WrfReadError("min_lead_hours 需要 WRF 文件内或配置中的起报时间")
             valid_start = run_start + timedelta(hours=min_lead_hours) if run_start else None
             valid_end = run_start + timedelta(hours=max_lead_hours) if run_start else None
+            selected_indices = [
+                index for index, time in enumerate(times)
+                if (period is None or period.start <= time <= period.end)
+                and (valid_start is None or time >= valid_start)
+                and (valid_end is None or time <= valid_end)
+            ]
+            if not selected_indices:
+                return
             for name in ("XLAT", "XLONG", *names):
                 variable = _ground_variable(dataset, name)
                 if variable.shape[0] != len(times):
                     raise WrfReadError(f"{name} 的时次数与 Times 不一致")
 
             units = {name: getattr(dataset.variables[name], "units", "") for name in names}
-            previous_grid = None
-            for time_index, time in enumerate(times):
-                if period is not None and not period.start <= time <= period.end:
-                    continue
-                if valid_start is not None and time < valid_start:
-                    continue
-                if valid_end is not None and time > valid_end:
-                    continue
+            for time_index in selected_indices:
+                time = times[time_index]
                 grid = tuple(np.ma.masked_invalid(dataset.variables[name][time_index, :, :], copy=False)
                              for name in ("XLONG", "XLAT"))
-                # 精确比较坐标及掩码，不以宽松容差忽略实际网格移动。
-                same_grid = previous_grid is not None and all(
-                    np.array_equal(current.data, previous.data)
-                    and np.array_equal(np.ma.getmaskarray(current), np.ma.getmaskarray(previous))
-                    for current, previous in zip(grid, previous_grid)
-                )
-                if not same_grid:
-                    locations = []
-                    for longitude, latitude in points:
-                        try:
-                            locations.append(_locate_point(longitude, latitude, *grid))
-                        except WrfReadError as exc:
-                            raise WrfReadError(f"点位 ({longitude:g}, {latitude:g}): {exc}") from exc
-                previous_grid = grid
+                locations = locator.locate(grid)
                 # 单点索引避免 netCDF4 多个索引数组产生笛卡尔积；重复格点只读一次。
                 samples = {}
                 for point in locations:

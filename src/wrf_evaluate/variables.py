@@ -63,7 +63,7 @@ class VariableConfig:
 
 
 # Defaults are only for fields verified in the supplied data templates.
-# Station precipitation deliberately has no default time_kind: verify its meaning first.
+# Station precipitation is drawn as recorded until its exact time window is configured.
 DEFAULT_VARIABLES = {
     "wrf": {
         "temperature_2m": VariableConfig("T2"),
@@ -90,7 +90,7 @@ DEFAULT_VARIABLES = {
         "wind_speed_10m": VariableConfig(
             "10min平均风速(m/s)", "m/s", "mean", timedelta(minutes=10), "end",
         ),
-        "precipitation": VariableConfig("小时降水量(mm)", "mm", None),
+        "precipitation": VariableConfig("小时降水量(mm)", "mm", "raw"),
     },
 }
 
@@ -231,17 +231,19 @@ def validate_variable(field: str, spec: VariableConfig) -> None:
         for role, item in spec.inputs:
             if item.units is not None:
                 convert_value(role, None, item.units, "instant")
-    if spec.time_kind not in {"instant", "mean", "sum", "cumulative"}:
+    if spec.time_kind not in {"instant", "mean", "sum", "cumulative", "raw"}:
         raise ValueError(
-            f"{field}.time_kind: 须明确填写 instant / mean / sum / cumulative"
+            f"{field}.time_kind: 须明确填写 instant / mean / sum / cumulative；站点降水可用 raw 仅绘图"
         )
     if spec.time_kind in {"mean", "sum"}:
         if spec.interval is None or spec.timestamp not in {"start", "end"}:
             raise ValueError(f"{field}: mean/sum 须填写 interval 和 timestamp = start/end")
     elif spec.interval is not None or spec.timestamp is not None:
-        raise ValueError(f"{field}: instant/cumulative 不使用 interval 或 timestamp")
-    if field == "precipitation" and spec.time_kind not in {"sum", "cumulative"}:
-        raise ValueError("precipitation: 只支持 sum 时段雨量或 cumulative 累计雨量")
+        raise ValueError(f"{field}: {spec.time_kind} 不使用 interval 或 timestamp")
+    if spec.time_kind == "raw" and field != "precipitation":
+        raise ValueError("raw 仅用于尚未确认时间窗口的站点降水绘图")
+    if field == "precipitation" and spec.time_kind not in {"sum", "cumulative", "raw"}:
+        raise ValueError("precipitation: 使用 sum、cumulative 或站点绘图专用的 raw")
     if field in {"temperature_2m", "relative_humidity_2m", "wind_speed_10m"} and spec.time_kind not in {"instant", "mean"}:
         raise ValueError(f"{field}: 只支持 instant 或 mean")
 

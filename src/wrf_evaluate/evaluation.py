@@ -131,6 +131,8 @@ def compare_series(
         raise ValueError("时间配对容差须为非负 timedelta")
     if forecast.unit != observation.unit:
         raise ValueError("指标计算前须统一单位")
+    if "raw" in {forecast.statistic, observation.statistic}:
+        raise ValueError("原始降水记录未定义时间窗口，仅绘图，不参与指标")
     if forecast.statistic == observation.statistic == "instant":
         groups = {None: _nearest_pairs(forecast, observation, tolerance)}
     elif forecast.statistic == observation.statistic:
@@ -154,6 +156,8 @@ def compare_forecast(
     """瞬时序列使用最新合并结果；时段量按完整窗口选择最新可覆盖的批次。"""
     if not isinstance(tolerance, timedelta) or tolerance < timedelta(0):
         raise ValueError("时间配对容差须为非负 timedelta")
+    if "raw" in {forecast.series.statistic, observation.statistic}:
+        raise ValueError("原始降水记录未定义时间窗口，仅绘图，不参与指标")
     if forecast.series.statistic == observation.statistic == "instant":
         return compare_series(forecast.series, observation, tolerance, field, thresholds)
     if forecast.series.unit != observation.unit:
@@ -172,12 +176,12 @@ def compare_forecast(
     return _build_comparisons(forecast.series, observation, groups, field, thresholds)
 
 
-def write_metrics(path: str | Path, comparisons: Sequence[Comparison]) -> Path:
+def write_metrics(path: str | Path, comparisons: Sequence[Comparison], *, unit: str | None = None) -> Path:
     """UTF-8 CSV；时段长度影响指标含义，配对容差只保留在配置副本中。"""
     path = Path(path)
-    if not comparisons:
+    if not comparisons and unit is None:
         raise ValueError("没有可输出的指标")
-    unit = comparisons[0].unit
+    unit = comparisons[0].unit if comparisons else unit
     event_fields = (
         ("命中数", "hits"), ("漏报数", "misses"), ("空报数", "false_alarms"),
         ("正确否定数", "correct_negatives"), ("漏报率", "miss_rate"),

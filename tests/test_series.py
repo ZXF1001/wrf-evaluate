@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from wrf_evaluate.config import PeriodConfig
-from wrf_evaluate.series import Series, normalize_series
+from wrf_evaluate.series import Series, hourly_precipitation, normalize_series
 from wrf_evaluate.variables import DEFAULT_VARIABLES, VariableConfig, convert_value, parse_variables, relative_humidity
 
 
@@ -186,6 +186,30 @@ class SeriesTests(unittest.TestCase):
                        ((time(0), time(90)), (time(30), time(60)))):
             with self.subTest(bounds=bounds), self.assertRaises(ValueError):
                 Series('test', (time(60), time(90)), (1, 2), bounds, 'sum', 'mm')
+
+    def test_hourly_rain_aggregates_minutes_but_not_gaps_or_partial_hours(self):
+        def curve(minutes, values):
+            times = [self.start + timedelta(minutes=m) for m in minutes]
+            return Series('wrf', tuple(times[1:]), tuple(values), tuple(zip(times, times[1:])), 'sum', 'mm')
+        result = hourly_precipitation(curve([0, 20, 40, 60, 90, 120, 130], [1, 2, 3, None, 5, 99]))
+        self.assertEqual(result.values, (6, None))
+        self.assertEqual(result.label, 'wrf（逐小时雨量）')
+        self.assertTrue(all(b - a == timedelta(hours=1) for a, b in result.bounds))
+        self.assertIsNone(hourly_precipitation(curve([5, 30, 60], [1, 2])))
+        gap = curve([0, 20, 40, 60], [1, 2, 3])
+        gap = Series('wrf', (gap.times[0], gap.times[2]), (1, 3),
+                     (gap.bounds[0], gap.bounds[2]), 'sum', 'mm')
+        self.assertIsNone(hourly_precipitation(gap))
+
+    def test_raw_rain_preserves_decreases_and_cannot_compute_metrics(self):
+        from wrf_evaluate.evaluation import compare_series
+
+        spec = dict(parse_variables({'precipitation': {'variable': '小时雨量', 'units': 'mm'}}, 'regional'))['precipitation']
+        curve = self.normalize('precipitation', spec, [0, 5, 10], [0.3, 0.8, 0.2], 'mm')
+        self.assertEqual(curve.values, (0.3, 0.8, 0.2))
+        self.assertEqual(curve.bounds, ())
+        with self.assertRaisesRegex(ValueError, '仅绘图'):
+            compare_series(curve, curve, timedelta(0), 'precipitation')
 
 
 if __name__ == '__main__':

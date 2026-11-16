@@ -60,7 +60,7 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.read_cldas = self.start_patch('wrf_evaluate.workflow.read_cldas_points', side_effect=sample)
         self.draw = self.start_patch('wrf_evaluate.workflow.plot_series')
         self.maps = self.start_patch('wrf_evaluate.workflow.plot_maps')
-        self.write_metrics = self.start_patch('wrf_evaluate.workflow.write_metrics', side_effect=lambda path, *args: path)
+        self.write_metrics = self.start_patch('wrf_evaluate.workflow.write_metrics', side_effect=lambda path, *args, **kwargs: path)
         self.run_directory = self.start_patch(
             'wrf_evaluate.workflow.create_run_directory', return_value=Path('unused-output/test-run_20261115_120000_000001'),
         )
@@ -76,7 +76,8 @@ class ComparisonWorkflowTests(unittest.TestCase):
     def test_native_times_units_missing_values_and_shared_excel_read(self):
         second = replace(self.point, name='second', station_id='Y5013')
         self.rows.append(replace(self.row(0, -1), station_id='Y5013'))
-        results = list(plot_comparisons(replace(self.config, points=(self.point, second))))
+        messages = []
+        results = list(plot_comparisons(replace(self.config, points=(self.point, second)), progress=messages.append))
         self.assertEqual(self.read_station.call_args.kwargs['fields'], ('temperature_2m',))
         self.read_frames.assert_called_once()
         self.assertEqual(self.read_frames.call_args.args[3], ((87.5, 43.5), (87.5, 43.5)))
@@ -98,6 +99,20 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.run_directory.assert_called_once_with(replace(self.config, points=(self.point, second)))
         self.assertTrue(all(result.path.parent == self.run_directory.return_value for result in results))
         self.assertEqual(results[0].series[1].label, 'cldas')
+        self.assertTrue(any('wrf：首末有效时次 2024-12-24 08:00 至 2024-12-24 09:00，有效点 2/2'
+                            in message for message in messages))
+
+    def test_progress_reports_uncovered_start_of_configured_period(self):
+        self.frames = [replace(frame, time=frame.time + timedelta(hours=1)) for frame in self.frames]
+        config = replace(self.config, period=PeriodConfig(self.time, self.time + timedelta(hours=3)))
+        messages = []
+
+        list(plot_comparisons(config, progress=messages.append))
+
+        self.assertTrue(any(
+            '开头未覆盖 1 小时，配置起点 2024-12-24 08:00' in message
+            for message in messages
+        ))
 
     def test_cldas_only_opens_latest_version_in_selected_period(self):
         older = Path(str(self.cldas_path).replace('20241226000900', '20241225000900'))
@@ -140,7 +155,8 @@ class ComparisonWorkflowTests(unittest.TestCase):
                                     'mm/h' if info.product == 'PRE' else 'K') for _ in args[1])}
 
         self.read_cldas.side_effect = sample
-        config = replace(self.config, sources=(wrf, cldas),
+        self.rows = [replace(row, values=row.values | {'precipitation': 0.3}) for row in self.rows]
+        config = replace(self.config, sources=(wrf, cldas, self.station),
                          elements=('temperature_2m', 'precipitation'), precipitation_thresholds_mm=(1,))
         temperature, rain_result = plot_comparisons(config)
         self.read_frames.assert_called_once()
@@ -153,16 +169,59 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.assertEqual(rain_result.comparisons[0].interval_seconds, 3600)
         self.assertEqual(temperature.element, 'temperature_2m')
         self.run_directory.assert_called_once()
-        self.read_station.assert_not_called()
+        self.read_station.assert_called_once()
+        self.assertEqual(rain_result.series[-1].statistic, 'raw')
+        self.assertEqual(len(rain_result.comparisons), 1)  # Only CLDAS has a defined rain window.
+        self.assertEqual(len(temperature.comparisons), 2)  # Station temperature still participates.
 
-    def test_unknown_station_rain_semantics_fail_before_any_data_read(self):
+    def test_station_rain_is_drawn_raw_without_fabricating_metrics(self):
         wrf = replace(self.wrf, variable_mapping=(
             ('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),
         ))
         config = replace(self.config, sources=(wrf, self.station), elements=('precipitation',))
-        with self.assertRaisesRegex(ConfigError, 'station.variables.precipitation.*time_kind'):
-            list(plot_comparisons(config))
-        self.read_station.assert_not_called()
+        self.frames = [replace(frame, values={'RAINNC': 10 + i}, units={'RAINNC': 'mm'})
+                       for i, frame in enumerate(self.frames)]
+        self.rows = [replace(self.row(m, 0), values={'precipitation': value})
+                     for m, value in ((0, 0.2), (5, 0.5), (10, 0.3))]
+        messages = []
+        result, = plot_comparisons(config, progress=messages.append)
+        self.assertEqual(result.series[0].values, (1,))
+        self.assertEqual(result.series[1].values, (0.2, 0.5, 0.3))
+        self.assertEqual(result.series[1].statistic, 'raw')
+        self.assertEqual(result.comparisons, ())
+        self.assertTrue(any('不计算该来源降水指标' in message for message in messages))
+        self.draw.assert_called_once()
+        with self.assertRaisesRegex(ValueError, '仅绘图'):
+            compare_forecast(_wrf_series(wrf, config)['test', 'precipitation'],
+                             result.series[1], timedelta(0), 'precipitation')
+
+    def test_minute_rain_uses_same_hourly_values_for_plot_and_metrics(self):
+        wrf = replace(self.wrf, variable_mapping=(
+            ('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),
+        ))
+        station = replace(self.station, variable_mapping=(
+            ('precipitation', VariableConfig('雨量', 'mm', 'sum', timedelta(hours=1), 'end')),
+        ))
+        self.frames = [replace(self.frames[0], time=self.time + timedelta(minutes=minute),
+                               values={'RAINNC': value}, units={'RAINNC': 'mm'})
+                       for minute, value in ((0, 100), (20, 101), (40, 103), (60, 106))]
+        self.rows = [replace(self.row(60, 0), values={'precipitation': 4})]
+        config = replace(self.config, sources=(wrf, station), elements=('precipitation',),
+                         precipitation_thresholds_mm=(5,))
+        result, = plot_comparisons(config)
+        self.assertEqual(result.series[0].values, (6,))
+        comparison, = result.comparisons
+        self.assertEqual(comparison.metrics.sample_count, 1)
+        self.assertEqual(comparison.metrics.mae, 2)
+        self.assertEqual(comparison.interval_seconds, 3600)
+        self.assertEqual(comparison.events[0][1].false_alarms, 1)
+        # An explicitly configured 20-minute observation cannot be compared
+        # with the hourly rain used in the plot by splitting the hourly total.
+        station = replace(station, variable_mapping=(
+            ('precipitation', VariableConfig('雨量', 'mm', 'sum', timedelta(minutes=20), 'end')),
+        ))
+        result, = plot_comparisons(replace(config, sources=(wrf, station)))
+        self.assertEqual(result.comparisons[0].metrics.sample_count, 0)
 
     def test_requested_station_fields_are_read_together(self):
         wrf = replace(self.wrf, variable_mapping=(
@@ -290,11 +349,11 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.read_station.assert_not_called()
         self.read_frames.assert_not_called()
 
-    def test_cli_prints_native_sample_counts(self):
+    def test_cli_prints_output_sample_counts(self):
         output = StringIO()
         with patch('wrf_evaluate.cli.load_config', return_value=self.config), redirect_stdout(output):
             self.assertEqual(main(['plot']), 0)
-        self.assertIn('3 个原生时次，2 个有效值', output.getvalue())
+        self.assertIn('3 个输出时次，2 个有效值', output.getvalue())
         self.assertIn('temperature_2m_001_test_', output.getvalue())
         self.assertIn('指标:', output.getvalue())
         text = output.getvalue()

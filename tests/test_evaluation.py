@@ -132,6 +132,15 @@ class SeriesEvaluationTests(unittest.TestCase):
             with self.subTest(tolerance=tolerance), self.assertRaises(ValueError):
                 self.compare(series, series, tolerance)
 
+    def test_no_verified_rain_comparisons_write_header_without_fake_scores(self):
+        output = mock_open()
+        with patch.object(Path, 'open', output):
+            write_metrics('rain.csv', [], unit='mm')
+        content = ''.join(call.args[0] for call in output().write.call_args_list)
+        reader = csv.DictReader(StringIO(content))
+        self.assertIn('RMSE(mm)', reader.fieldnames)
+        self.assertEqual(list(reader), [])
+
 
 class PeriodEvaluationTests(unittest.TestCase):
     def setUp(self):

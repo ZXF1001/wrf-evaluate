@@ -297,6 +297,8 @@ def load_config(path: str | Path) -> Config:
             if element in DISPLAY_NAMES:
                 try:
                     validate_variable(element, spec)
+                    if spec.time_kind == "raw" and kind != "regional":
+                        raise ValueError("raw 仅用于区域站降水绘图")
                     if spec.units is not None:
                         convert_value(element, None, spec.units, spec.time_kind, spec.interval)
                     if kind == "cldas" and any(

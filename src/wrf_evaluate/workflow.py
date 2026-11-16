@@ -7,6 +7,7 @@ from datetime import timedelta, timezone
 from pathlib import Path
 import re
 from time import monotonic
+from zoneinfo import ZoneInfo
 
 from .catalog import iter_source_files
 from .cldas import read_cldas_points
@@ -17,10 +18,10 @@ from .matching import index_cldas_files, iter_cldas_input_files
 from .maps import plot_maps
 from .output import create_run_directory
 from .plotting import plot_series
-from .series import Series, normalize_series
+from .series import Series, hourly_precipitation, normalize_series
 from .station import iter_regional_observations
 from .variables import convert_value, relative_humidity, validate_variable
-from .wrf import iter_wrf_points_frames, resolve_wrf_variable
+from .wrf import WrfPointLocator, iter_wrf_points_frames, resolve_wrf_variable
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,8 @@ def _validate_sources(config: Config) -> list[SourceConfig]:
             spec = source.variable(field)
             try:
                 validate_variable(field, spec)
+                if spec.time_kind == "raw" and source.kind != "regional":
+                    raise ValueError("raw 仅用于区域站降水绘图")
                 if spec.units is not None:
                     convert_value(field, None, spec.units, spec.time_kind, spec.interval)
                 if source.kind == "regional" and spec.units is None:
@@ -133,10 +136,14 @@ def _label(source: SourceConfig, field: str, *, station_id: str | None = None) -
         name += f"（站号 {station_id}）"
     if spec.time_kind == "mean":
         name += f"（{spec.interval.total_seconds() / 60:g}分钟平均）"
-    elif spec.time_kind == "sum":
+    elif spec.time_kind == "sum" and field != "precipitation":
         name += f"（{spec.interval.total_seconds() / 60:g}分钟量）"
-    elif spec.time_kind == "cumulative":
+    elif spec.time_kind == "cumulative" and field != "precipitation":
         name += "（累计差分）"
+    elif field == "precipitation" and spec.time_kind == "cumulative":
+        name += "（逐小时雨量）"
+    elif spec.time_kind == "raw":
+        name += "（原始时段雨量）"
     elif field == "wind_speed_10m":
         name += "（瞬时）"
     return name
@@ -158,6 +165,7 @@ def _wrf_series(
     frames_read = 0
     files_read = 0
     coordinates = tuple((point.longitude, point.latitude) for point in config.points)
+    locator = WrfPointLocator(coordinates)
     last_report = monotonic() - 5
     reported_starts = set()
     _notify(progress, f"读取 WRF 来源 {source.name}：一次提取 {len(coordinates)} 个点位…")
@@ -172,18 +180,20 @@ def _wrf_series(
             path, names, source.timezone, coordinates, period=config.period,
             init_time=directory_start, min_lead_hours=source.min_lead_hours,
             max_lead_hours=source.max_lead_hours,
+            locator=locator,
         )) as frames:
             start = None
             for batch in frames:
                 frames_read += 1
                 if start is None:
                     start = forecast_init_time(source, path, batch[0].model_start_time)
-                eligible_from = valid_from(source, start)
-                if eligible_from is not None and batch[0].time < eligible_from:
-                    continue
                 if start not in reported_starts:
                     _notify(progress, f"{source.name} 起报：{start.isoformat() if start else '未提供'}；"
                             f"最低预报时效 {source.min_lead_hours:g} 小时")
+                    if start is not None:
+                        cutoff = valid_from(source, start).astimezone(ZoneInfo(config.display_timezone))
+                        _notify(progress, f"{source.name} 该批次允许使用的起点：{cutoff:%Y-%m-%d %H:%M}"
+                                f"（{config.display_timezone}）；实际覆盖以文件内时次和有效数值为准")
                     reported_starts.add(start)
                 if directory_start is not None and batch[0].model_start_time not in (None, directory_start):
                     mismatch = (directory_start, batch[0].model_start_time)
@@ -223,6 +233,8 @@ def _wrf_series(
                         _label(source, field), field, source.variable(field), records[point.name, field],
                         config.period, allow_empty=True,
                     )
+                    if curve is not None and field == "precipitation":
+                        curve = hourly_precipitation(curve)
                     latest = start + timedelta(hours=source.max_lead_hours) if start is not None else None
                     curve = eligible_series(curve, valid_from(source, start), latest)
                 except ValueError as exc:
@@ -230,6 +242,8 @@ def _wrf_series(
                 if curve is not None:
                     runs.append((start, curve))
             if not runs:
+                if field == "precipitation":
+                    raise ValueError(f"点位 {point.name}: 没有完整的整点一小时 WRF 降水区间，请检查 period、预报时效和数据覆盖")
                 raise ValueError(f"点位 {point.name}: {field} 的有效预报时效内没有可用 WRF 记录")
             try:
                 result[point.name, field] = select_latest(runs)
@@ -307,7 +321,7 @@ def _cldas_series(
 def plot_comparisons(
     config: Config, *, progress: Callable[[str], None] | None = None,
 ) -> Iterator[PlotResult]:
-    """各来源按原生时次叠图；指标另行配对，可选报告处理进度。"""
+    """各来源叠图（WRF 降水合成逐小时量）；指标另行配对，支持进度回调。"""
     _notify(progress, f"开始检验：{len(config.points)} 个点位，{len(config.elements)} 个要素。")
     sources = _validate_sources(config)
     wrf = [source for source in sources if source.kind == "wrf" and _fields(source, config)]
@@ -329,6 +343,7 @@ def plot_comparisons(
             forecasts[key].append(curve)
     cldas_curves = _cldas_series(cldas, index, config, progress)
     output_dir = None
+    display_zone = ZoneInfo(config.display_timezone)
     stamp = f"{config.period.start.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}_{config.period.end.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
     for point_index, point in enumerate(config.points, start=1):
         try:
@@ -336,15 +351,37 @@ def plot_comparisons(
             for field in config.elements:
                 observations = list(cldas_curves.get((point.name, field), ()))
                 observations.extend(station_curves.get((point.station_id, field), ()))
+                for observation in observations:
+                    if observation.statistic == "raw":
+                        _notify(progress, f"{point.name} / {observation.label}：降水按原始记录绘图；时间窗口未定义，不计算该来源降水指标")
                 _notify(progress, f"计算 {point.name} 的 {config.display_name(field)}指标…")
+                forecasts_for_field = forecasts.pop((point.name, field))
                 comparisons = tuple(
                     comparison
-                    for forecast in forecasts[point.name, field] for observation in observations
+                    for forecast in forecasts_for_field for observation in observations
+                    if observation.statistic != "raw"
                     for comparison in compare_forecast(
                         forecast, observation, config.time_tolerance, field, config.precipitation_thresholds_mm,
                     )
                 )
-                curves = tuple(forecast.series for forecast in forecasts.pop((point.name, field))) + tuple(observations)
+                curves = tuple(forecast.series for forecast in forecasts_for_field) + tuple(observations)
+                for curve in curves:
+                    valid_times = [time for time, value in zip(curve.times, curve.values) if value is not None]
+                    if valid_times:
+                        coverage = (f"首末有效时次 {valid_times[0].astimezone(display_zone):%Y-%m-%d %H:%M}"
+                                    f" 至 {valid_times[-1].astimezone(display_zone):%Y-%m-%d %H:%M}，"
+                                    f"有效点 {len(valid_times):,}/{len(curve.times):,}")
+                        first_index = curve.times.index(valid_times[0])
+                        covered_start = curve.bounds[first_index][0] if curve.bounds else valid_times[0]
+                        if covered_start > config.period.start:
+                            gap_hours = (covered_start - config.period.start).total_seconds() / 3600
+                            coverage += (
+                                f"；开头未覆盖 {gap_hours:g} 小时，配置起点"
+                                f" {config.period.start.astimezone(display_zone):%Y-%m-%d %H:%M}"
+                            )
+                    else:
+                        coverage = f"无有效数值（0/{len(curve.times):,}）"
+                    _notify(progress, f"{point.name} / {config.display_name(field)} / {curve.label}：{coverage}")
                 name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", point.name).strip(" .") or "point"
                 if output_dir is None:
                     _notify(progress, "创建本次独立输出目录…")
@@ -354,7 +391,7 @@ def plot_comparisons(
                 plot_series(path, point, curves, config.display_timezone, period=config.period,
                             element_name=config.display_name(field))
                 _notify(progress, f"写入 {path.name} 对应 CSV…")
-                metrics_path = write_metrics(path.with_suffix(".csv"), comparisons)
+                metrics_path = write_metrics(path.with_suffix(".csv"), comparisons, unit=curves[0].unit)
                 yield PlotResult(point, field, path, curves, metrics_path, comparisons)
         except (OSError, ValueError) as exc:
             raise ValueError(f"点位 {point.name}: {exc}") from exc

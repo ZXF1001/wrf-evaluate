@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     scan = commands.add_parser("scan", help="统计原始文件数量、大小及少量示例")
     scan.add_argument("--source", help="仅扫描指定来源，如 wrf 或 regional")
     commands.add_parser("inspect", help="读取 WRF/CLDAS 元数据并显示配置点位")
-    commands.add_parser("plot", help="按配置要素输出原生时次 PNG 和指标 CSV")
+    commands.add_parser("plot", help="按配置要素输出对比 PNG 和指标 CSV")
     commands.add_parser("match", help="按配置的时间容差核验 WRF—CLDAS 配对覆盖，不计算指标")
     args = parser.parse_args(argv)
 
@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"已生成 {result.point.name}: {result.path}")
                 for curve in result.series:
                     valid = sum(value is not None for value in curve.values)
-                    print(f"  {curve.label}: {len(curve.times)} 个原生时次，{valid} 个有效值；"
+                    print(f"  {curve.label}: {len(curve.times)} 个输出时次，{valid} 个有效值；"
                           f"{curve.times[0].isoformat()} -> {curve.times[-1].isoformat()}")
                 print(f"  指标: {result.metrics_path}")
                 for comparison in result.comparisons:
