@@ -1,6 +1,6 @@
 """只读 WRF 文件；先读时间和元数据，再按需读取单时刻二维变量。"""
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -70,12 +70,13 @@ WrfValue = float | np.ma.MaskedArray | None
 
 def resolve_wrf_variable(
     spec: VariableConfig, values: Mapping[str, WrfValue], units: Mapping[str, str],
+    on_invalid: Callable[[str], None] | None = None,
 ) -> tuple[WrfValue, str]:
     """直接字段、10 米风速或派生湿度；点值与空间场共用同一规则。"""
     if spec.inputs:
         return relative_humidity(
             {role: values[item.variable] for role, item in spec.inputs},
-            {role: units[item.variable] for role, item in spec.inputs}, spec,
+            {role: units[item.variable] for role, item in spec.inputs}, spec, on_invalid,
         ), "%"
     if not spec.components:
         return values[spec.variable], units[spec.variable]

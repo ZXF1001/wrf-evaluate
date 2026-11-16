@@ -94,10 +94,15 @@ def _forecast_field(
         if grid is not None and not all(np.array_equal(x, y) for x, y in zip(grid, coordinates)):
             raise ValueError("目标时段内 WRF 网格移动，不能直接逐格累计或差分")
         grid = coordinates
-        native, units = resolve_wrf_variable(
-            spec, {name: item.values for name, item in fields.items()},
-            {name: item.units for name, item in fields.items()},
-        )
+        location = f"{path} Time[{index}] {time.isoformat()}"
+        report = (lambda message: progress(f"警告：{location}: {message}")) if progress else None
+        try:
+            native, units = resolve_wrf_variable(
+                spec, {name: item.values for name, item in fields.items()},
+                {name: item.units for name, item in fields.items()}, report,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{location}: {exc}") from exc
         value = _converted(field, native, units, spec)
         if spec.time_kind == "cumulative":
             before, previous = previous, value
@@ -121,7 +126,7 @@ def _crop_axis(axis: np.ndarray, lower: float, upper: float) -> slice:
     return slice(int(indices[0]), int(indices[-1]) + 1)
 
 
-def _observation_field(files, spec, field, header, selection, timezone):
+def _observation_field(files, spec, field, header, selection, timezone, progress=None):
     """派生湿度在同网格的原始场上计算，只加载 WRF 范围内的 CLDAS 子区域。"""
     values, units = {}, {}
     headers = {header.path: header}
@@ -140,7 +145,12 @@ def _observation_field(files, spec, field, header, selection, timezone):
         native = native_fields[key]
         values[role], units[role] = native.values, native.units
     if spec.inputs:
-        return relative_humidity(values, units, spec)
+        location = f"CLDAS {header.time.isoformat()} ({', '.join(str(path) for path in headers)})"
+        report = (lambda message: progress(f"警告：{location}: {message}")) if progress else None
+        try:
+            return relative_humidity(values, units, spec, report)
+        except ValueError as exc:
+            raise ValueError(f"{location}: {exc}") from exc
     return _converted(field, values["value"], units["value"], spec)
 
 
@@ -244,7 +254,7 @@ def plot_maps(
                         columns = _crop_axis(header.longitudes, *extent[:2])
                         rows = _crop_axis(header.latitudes, *extent[2:])
                         observed = _observation_field(files_by_role, spec, field, header,
-                                                      (rows, columns), source.timezone)
+                                                      (rows, columns), source.timezone, progress)
                         if field.startswith("surface_") and spec.time_kind == "sum":
                             observed = observed / (end - start).total_seconds()
                         observation = header.longitudes[columns], header.latitudes[rows], observed

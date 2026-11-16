@@ -281,6 +281,23 @@ class ComparisonWorkflowTests(unittest.TestCase):
             list(plot_comparisons(self.humidity_samples(moved_grid=True)))
         self.draw.assert_not_called()
 
+    def test_invalid_wrf_humidity_warns_with_origin_and_is_excluded_from_metrics(self):
+        config = self.humidity_samples()
+        self.frames[0] = replace(self.frames[0], values=self.frames[0].values | {'Q2': -1e-8})
+        messages = []
+        _, humidity = plot_comparisons(config, progress=messages.append)
+        self.assertIsNone(humidity.series[0].values[0])
+        self.assertAlmostEqual(humidity.series[0].values[1], 50)
+        self.assertEqual(humidity.comparisons[0].metrics.sample_count, 1)
+        warning = next(message for message in messages if '输入无效' in message)
+        for text in (str(self.frames[0].path), self.frames[0].time.isoformat(), '点位 test', 'Q2', '-1e-08'):
+            self.assertIn(text, warning)
+        self.frames = [replace(frame, values=frame.values | {'Q2': -1e-8}) for frame in self.frames]
+        self.draw.reset_mock()
+        with self.assertRaisesRegex(ValueError, '全部缺测'):
+            list(plot_comparisons(config, progress=messages.append))
+        self.draw.assert_not_called()
+
     def test_missing_station_or_wrong_period_is_not_silently_omitted(self):
         for rows in ([], [self.row(-5, 1)], [replace(self.row(0, 1), station_id='wrong')]):
             self.rows = rows

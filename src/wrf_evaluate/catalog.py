@@ -32,7 +32,7 @@ def scan_source(source: SourceConfig, example_limit: int = 3) -> ScanResult:
     """单次遍历，只保存待扫描目录、统计与少量示例。
 
     *.nc 匹配任意层级文件名；含 / 的模式从数据源根目录逐段匹配，
-    如 2024/12/*.nc。模式扫描跳过符号链接；站点来源只统计配置的文件。
+    如 2024/12/*.nc。跟随文件和目录符号链接，跳过目录循环；站点来源只统计配置的文件。
     """
     if example_limit < 0:
         raise ValueError("example_limit 不能为负数")
@@ -62,16 +62,20 @@ def iter_source_files(
         yield from source.files
         return
     patterns = [tuple(pattern.split("/")) for pattern in source.patterns]
-    pending = [source.root]
+    pending = [(source.root, frozenset())]
     while pending:
-        directory = pending.pop()
+        directory, ancestors = pending.pop()
         if include_directory is not None and not include_directory(directory):
             continue
+        info = directory.stat()
+        identity = info.st_dev, info.st_ino
+        if identity in ancestors:
+            continue
+        # 只检测当前分支的循环；保留链接路径，使起报目录名和 patterns 仍按用户路径解释。
+        ancestors = ancestors | {identity}
         with os.scandir(directory) as entries:
             for entry in entries:
-                if entry.is_symlink():
-                    continue
-                if entry.is_dir(follow_symlinks=False):
+                if entry.is_dir():
                     path = Path(entry.path)
                     parts = path.relative_to(source.root).parts
                     # 带目录的规则只进入可能匹配的前缀，避免遍历国家站等无关目录。
@@ -82,9 +86,9 @@ def iter_source_files(
                         )
                         for pattern in patterns
                     ):
-                        pending.append(path)
+                        pending.append((path, ancestors))
                     continue
-                if entry.is_file(follow_symlinks=False):
+                if entry.is_file():
                     path = Path(entry.path)
                     if any(_matches(path.relative_to(source.root).parts, pattern) for pattern in patterns):
                         yield path

@@ -1,8 +1,10 @@
 """Unified element names and source-specific variable metadata."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import timedelta
 import re
+import warnings
 
 import numpy as np
 
@@ -305,10 +307,13 @@ def convert_value(
     return result
 
 
-def relative_humidity(values: dict, units: dict[str, str], spec: VariableConfig):
+def relative_humidity(
+    values: dict, units: dict[str, str], spec: VariableConfig,
+    on_invalid: Callable[[str], None] | None = None,
+):
     """液态水基准：Bolton 饱和水汽压；混合比和比湿使用各自的水汽压公式。
 
-    标量和掩码数组共用计算；缺测传播，结果限制在 0–100%。
+    标量和掩码数组共用计算；无效输入告警并保留缺测，结果限制在 0–100%。
     """
     inputs = dict(spec.inputs)
     converted = {
@@ -323,14 +328,49 @@ def relative_humidity(values: dict, units: dict[str, str], spec: VariableConfig)
     moisture = np.ma.masked_invalid(np.ma.asarray(
         converted["specific_humidity" if specific else "mixing_ratio"], dtype=np.float64,
     ))
-    if (np.ma.any(temperature <= -243.5) or np.ma.any(pressure <= 0)
-            or np.ma.any(moisture < 0) or (specific and np.ma.any(moisture >= 1))):
-        raise ValueError("相对湿度输入无效：请核对温度、正气压、非负水汽量；比湿须小于 1 kg/kg")
+    # 先合并三个输入的缺测掩码，避免对已经不可用的格点单独报错。
+    mask = (np.ma.getmaskarray(temperature) | np.ma.getmaskarray(pressure)
+            | np.ma.getmaskarray(moisture))
+    shape = np.broadcast_shapes(temperature.shape, pressure.shape, moisture.shape)
+    temperature, pressure, moisture = (
+        np.ma.array(np.broadcast_to(value.data, shape), mask=np.broadcast_to(mask, shape), copy=False)
+        for value in (temperature, pressure, moisture)
+    )
+    if not shape and np.ma.is_masked(temperature):
+        return None
+    invalid = np.zeros(shape, dtype=bool)
+    details = []
+    moisture_role = "specific_humidity" if specific else "mixing_ratio"
+    for role, value, bad, limit, unit in (
+        ("temperature", temperature, temperature <= -243.5, "> -243.5", "degC"),
+        ("pressure", pressure, pressure <= 0, "> 0", "Pa"),
+        (moisture_role, moisture, (moisture < 0) | ((moisture >= 1) if specific else False),
+         "[0, 1)" if specific else ">= 0", "kg/kg"),
+    ):
+        bad = np.ma.filled(bad, False)
+        if np.any(bad):
+            invalid |= bad
+            bad_values = value.data[bad]
+            details.append(f"{inputs[role].variable} ({role})：{bad_values.size} 个，"
+                           f"范围 {bad_values.min():.6g}–{bad_values.max():.6g} {unit}，要求 {limit}")
+    if details:
+        message = (f"相对湿度：{int(np.count_nonzero(invalid))} 个位置的输入无效，已保留为缺测；"
+                   + "；".join(details) + "。请核对原始值、缺测标记和映射单位")
+        if on_invalid is None:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        else:
+            on_invalid(message)
+        temperature, pressure, moisture = (
+            np.ma.array(value.data, mask=np.ma.getmaskarray(value) | invalid, copy=False)
+            for value in (temperature, pressure, moisture)
+        )
+    if temperature.ndim == 0 and np.ma.is_masked(temperature):
+        return None
     epsilon = 0.622
     vapor_pressure = (moisture * pressure / (epsilon + (1 - epsilon) * moisture)
                       if specific else moisture * pressure / (epsilon + moisture))
     if np.ma.any(vapor_pressure >= pressure):
-        raise ValueError("相对湿度输入无效：水汽分压须小于总气压")
+        raise ValueError("相对湿度输入无效：水汽分压须小于总气压，请核对水汽量及单位")
     saturation = 611.2 * np.ma.exp(17.67 * temperature / (temperature + 243.5))
     result = np.ma.clip(np.ma.masked_invalid(100.0 * vapor_pressure / saturation), 0.0, 100.0)
     if result.ndim == 0:

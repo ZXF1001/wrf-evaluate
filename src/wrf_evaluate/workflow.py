@@ -216,7 +216,12 @@ def _wrf_series(
                         if run_locations.setdefault(key, location) != location:
                             raise ValueError(f"{path}: 点位 {point.name} 的 WRF 取值网格发生移动，不能对不同格点的累计量差分")
                     for field in fields:
-                        value, units = resolve_wrf_variable(specs[field], frame.values, frame.units)
+                        location = f"{path} Time[{frame.time_index}] {frame.time.isoformat()} 点位 {point.name}"
+                        report = (lambda message: progress(f"警告：{location}: {message}")) if progress else None
+                        try:
+                            value, units = resolve_wrf_variable(specs[field], frame.values, frame.units, report)
+                        except ValueError as exc:
+                            raise ValueError(f"{location}: {exc}") from exc
                         run_records[start][point.name, field].append(
                             (frame.time, value, units, f"{path} Time[{frame.time_index}]")
                         )
@@ -297,8 +302,12 @@ def _cldas_series(
                         if any(position is None for position in positions) or len(set(positions)) != 1:
                             raise ValueError(f"{location}: 湿度基础变量的最近格点经纬度不一致，不能组合")
                         try:
+                            paths = ", ".join(str(sample.path) for sample in selected.values())
+                            report = (lambda message: progress(
+                                f"警告：{location} 点位 {point.name} ({paths}): {message}"
+                            )) if progress else None
                             value = relative_humidity({role: s.value for role, s in selected.items()},
-                                                      {role: s.units for role, s in selected.items()}, spec)
+                                                      {role: s.units for role, s in selected.items()}, spec, report)
                         except ValueError as exc:
                             raise ValueError(f"{location} 点位 {point.name}: {exc}") from exc
                     else:

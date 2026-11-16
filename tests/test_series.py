@@ -55,15 +55,53 @@ class VariableTests(unittest.TestCase):
         self.assertEqual(relative_humidity(values, units, spec), 100)
         self.assertEqual(relative_humidity(values | {'mixing_ratio': 0}, units, spec), 0)
         self.assertIsNone(relative_humidity(values | {'mixing_ratio': None}, units, spec))
+        self.assertIsNone(relative_humidity(values | {'pressure': float('nan')}, units, spec))
         result = relative_humidity(values | {
             'temperature': np.ma.array([273.15, 273.15, np.nan], mask=[0, 1, 0]),
         }, units, spec)
         self.assertEqual(result.mask.tolist(), [False, True, True])
         for changes in ({'pressure': 0}, {'mixing_ratio': -0.001}, {'temperature': 0}):
-            with self.subTest(changes=changes), self.assertRaises(ValueError):
-                relative_humidity(values | changes, units, spec)
+            with self.subTest(changes=changes), self.assertWarnsRegex(RuntimeWarning, '已保留为缺测'):
+                self.assertIsNone(relative_humidity(values | changes, units, spec))
+        with self.assertWarns(RuntimeWarning):
+            result = relative_humidity(values | {'pressure': np.zeros((2, 2))}, units, spec)
+        self.assertEqual(result.count(), 0)
         self.assertEqual(convert_value('relative_humidity_2m', 120, '%', 'instant'), 100)
         self.assertEqual(convert_value('relative_humidity_2m', -5, '%', 'instant'), 0)
+
+    def test_humidity_combines_input_masks_before_checking_invalid_values(self):
+        spec = DEFAULT_VARIABLES['wrf']['relative_humidity_2m']
+        units = {'temperature': 'K', 'pressure': 'Pa', 'mixing_ratio': 'kg/kg'}
+        ratio = 0.622 * 305.6 / (90000 - 305.6)
+        values = {'temperature': np.ma.array([273.15] * 4, mask=[0, 1, 0, 0]),
+                  'pressure': np.ma.array([90000, 0, 90000, 0], mask=[0, 0, 1, 0]),
+                  'mixing_ratio': np.ma.array([ratio, -999, -1, ratio], mask=[0, 0, 0, 1])}
+        originals = {key: value.copy() for key, value in values.items()}
+        messages = []
+        result = relative_humidity(values, units, spec, messages.append)
+        self.assertAlmostEqual(result[0], 50)
+        np.testing.assert_array_equal(result.mask, [False, True, True, True])
+        self.assertEqual(messages, [])
+        for key, value in values.items():
+            np.testing.assert_array_equal(value.data, originals[key].data)
+            np.testing.assert_array_equal(value.mask, originals[key].mask)
+
+    def test_humidity_invalid_cells_are_missing_with_converted_value_diagnostics(self):
+        spec = DEFAULT_VARIABLES['cldas']['relative_humidity_2m']
+        units = {'temperature': 'degC', 'pressure': 'hPa', 'specific_humidity': 'g/kg'}
+        values = {'temperature': np.array([0, 0, 0, 0, 0, 0, np.nan]),
+                  'pressure': np.array([900, 900, 900, 900, 0, 900, 900]),
+                  'specific_humidity': np.array([1, -0.001, 1000, 1001, 1, 0, 1])}
+        messages = []
+        result = relative_humidity(values, units, spec, messages.append)
+        np.testing.assert_array_equal(result.mask, [False, True, True, True, True, False, True])
+        self.assertGreater(result[0], 0)
+        self.assertEqual(result[5], 0)
+        self.assertEqual(len(messages), 1)
+        for text in ('4 个位置', 'PAIR', 'QAIR', '-1e-06', 'kg/kg', 'Pa'):
+            self.assertIn(text, messages[0])
+        with self.assertRaisesRegex(ValueError, '气压单位'):
+            relative_humidity(values, units | {'pressure': 'bad'}, spec)
 
     def test_wrf_wind_uses_two_components_and_rejects_single_component(self):
         spec = DEFAULT_VARIABLES['wrf']['wind_speed_10m']

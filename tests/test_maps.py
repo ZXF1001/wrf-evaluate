@@ -52,6 +52,16 @@ class MapTests(unittest.TestCase):
         self.assertEqual(result[0, 1], 100)
         self.assertTrue(result.mask[1, 0])
         self.assertEqual(result[1, 1], 0)
+        fields['Q2'].values[1, 1] = -1e-8
+        messages = []
+        with patch('wrf_evaluate.maps.read_wrf_fields', return_value=fields):
+            _, _, result = _forecast_field(self.frames, 'relative_humidity_2m',
+                                          DEFAULT_VARIABLES['wrf']['relative_humidity_2m'],
+                                          self.start, self.start, messages.append)
+        self.assertAlmostEqual(result[0, 0], 50)
+        self.assertTrue(result.mask[1, 1])
+        self.assertIn('wrf Time[0]', messages[0])
+        self.assertIn('Q2', messages[0])
 
     def test_cldas_humidity_crop_and_grid_validation(self):
         spec = DEFAULT_VARIABLES['cldas']['relative_humidity_2m']
@@ -69,6 +79,16 @@ class MapTests(unittest.TestCase):
         np.testing.assert_allclose(result, 50)
         self.assertEqual(read.call_count, 3)
         self.assertTrue(all(call.kwargs['selection'] == selection for call in read.call_args_list))
+        fields['QAIR'].values[0, 0] = 1
+        messages = []
+        with patch('wrf_evaluate.maps.read_cldas_header', return_value=header), \
+             patch('wrf_evaluate.maps.read_cldas_field', side_effect=lambda path, name, **kw: fields[name]):
+            result = _observation_field(files, spec, 'relative_humidity_2m', header, selection,
+                                        'UTC', messages.append)
+        self.assertTrue(result.mask[0, 0])
+        self.assertAlmostEqual(result[1, 1], 50)
+        for text in ('CLDAS', self.start.isoformat(), 'SHU', 'QAIR', 'kg/kg'):
+            self.assertIn(text, messages[0])
         with patch('wrf_evaluate.maps.read_cldas_header', return_value=replace(header, longitudes=self.lon[0] + .01)), \
              patch('wrf_evaluate.maps.read_cldas_field', return_value=fields['QAIR']):
             with self.assertRaisesRegex(ValueError, '网格不一致'):

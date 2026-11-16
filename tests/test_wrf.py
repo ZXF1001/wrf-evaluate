@@ -288,6 +288,56 @@ class WrfReaderTests(unittest.TestCase):
         self.assertEqual(forecast.series.values, (2,))
         self.assertEqual(forecast.series.bounds[0][0], start + timedelta(hours=1))
 
+    def test_previous_run_covers_start_until_new_run_reaches_minimum_lead(self):
+        self.add_coordinates()
+        period = PeriodConfig(datetime.fromisoformat('2024-12-01T12:00:00+08:00'),
+                              datetime.fromisoformat('2024-12-01T15:00:00+08:00'))
+        # Both batches cover 04:00–07:30 UTC, with two frames per file.
+        # The new 00 UTC run is usable only from 06 UTC (14:00 Beijing).
+        for layout in ('directories', 'linked_directory', 'linked_files'):
+            with self.subTest(layout=layout):
+                root = self.root / layout / 'wrf'
+                root.mkdir(parents=True)
+                archive = root.parent / 'archive'
+                archive.mkdir()
+                for directory, start, temperature in (
+                    ('2024113012', '2024-11-30_12:00:00', 273.15),
+                    ('2024120100', '2024-12-01_00:00:00', 283.15),
+                ):
+                    run = root / directory
+                    old = directory == '2024113012'
+                    if old and layout == 'linked_directory':
+                        run.symlink_to(archive, target_is_directory=True)
+                        (archive / 'back').symlink_to(root, target_is_directory=True)
+                    else:
+                        run.mkdir()
+                    for hour in range(3, 8):
+                        name = f'wrfout_d03_2024-12-01_{hour:02}_00_00'
+                        path = archive / name if old and layout == 'linked_files' else run / name
+                        path.write_bytes(self.path.read_bytes())
+                        with Dataset(path, 'a') as dataset:
+                            dataset.SIMULATION_START_DATE = start
+                            times = dataset.variables['Times']
+                            times.set_auto_chartostring(False)
+                            times[:] = stringtochar(np.array([
+                                f'2024-12-01_{hour:02}:{minute:02}:00' for minute in (0, 30)
+                            ], dtype='S19'))
+                            dataset.variables['T2'][:] = temperature
+                        if old and layout == 'linked_files':
+                            (run / name).symlink_to(path)
+                source = SourceConfig('wrf', 'wrf', root, ('wrfout_d03*',), 'UTC', True,
+                                      min_lead_hours=6)
+                config = Config((source,), self.root / 'unused', 'Asia/Shanghai', timedelta(seconds=60),
+                                points=(PointConfig('test', 87.01, 43.01),), period=period)
+                # Keep the real scan/read/merge chain, including directory time precedence.
+                with patch('wrf_evaluate.wrf.Dataset', wraps=Dataset) as opened:
+                    forecast = _wrf_series(source, config)['test', 'temperature_2m']
+                self.assertEqual(forecast.series.times,
+                                 tuple(period.start + timedelta(minutes=30 * i) for i in range(7)))
+                np.testing.assert_allclose(forecast.series.values, [0, 0, 0, 0, 10, 10, 10], atol=1e-4)
+                self.assertEqual(len(forecast.runs), 2)
+                self.assertEqual(opened.call_count, 6)  # Four old files, two eligible new files.
+
     def test_point_frames_keep_missing_values_and_relocate_moving_grid(self):
         self.add_coordinates()
         for longitude in (88.01, 88.99):
