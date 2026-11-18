@@ -14,7 +14,7 @@ from netCDF4 import Dataset, stringtochar
 
 from wrf_evaluate.cli import main
 from wrf_evaluate.spatial import nearest_grid_point
-from wrf_evaluate.config import Config, PeriodConfig, PointConfig, SourceConfig
+from wrf_evaluate.config import Config, MetricsOptions, PeriodConfig, PointConfig, SourceConfig
 from wrf_evaluate.workflow import _wrf_series
 from wrf_evaluate.wrf import (
     WrfField, WrfFieldReader, WrfPointLocator, WrfReadError, iter_wrf_point_frames, iter_wrf_points_frames, read_wrf_field,
@@ -276,8 +276,9 @@ class WrfReaderTests(unittest.TestCase):
                 rain[0], rain[1] = 100 + hour * 2, 101 + hour * 2
         source = SourceConfig('wrf', 'wrf', self.root, ('*.nc',), 'UTC', True,
                               variable_mapping=(('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),))
-        config = Config((source,), self.root / 'unused', 'UTC', timedelta(0),
-                        points=(PointConfig('test', 87.01, 43.01),), elements=('precipitation',),
+        config = Config((source,), self.root / 'unused', 'UTC',
+                        points=(PointConfig('test', 87.01, 43.01),),
+                        metrics=(('precipitation', MetricsOptions()),),
                         period=PeriodConfig(start, start + timedelta(hours=2)))
         with patch('wrf_evaluate.wrf.Dataset', wraps=Dataset) as opened:
             forecast = _wrf_series(source, config)['test', 'precipitation']
@@ -327,8 +328,9 @@ class WrfReaderTests(unittest.TestCase):
                             (run / name).symlink_to(path)
                 source = SourceConfig('wrf', 'wrf', root, ('wrfout_d03*',), 'UTC', True,
                                       min_lead_hours=6)
-                config = Config((source,), self.root / 'unused', 'Asia/Shanghai', timedelta(seconds=60),
-                                points=(PointConfig('test', 87.01, 43.01),), period=period)
+                config = Config((source,), self.root / 'unused', 'Asia/Shanghai',
+                                points=(PointConfig('test', 87.01, 43.01),), period=period,
+                                metrics=(('temperature_2m', MetricsOptions()),))
                 # Keep the real scan/read/merge chain, including directory time precedence.
                 with patch('wrf_evaluate.wrf.Dataset', wraps=Dataset) as opened:
                     forecast = _wrf_series(source, config)['test', 'temperature_2m']
@@ -337,6 +339,94 @@ class WrfReaderTests(unittest.TestCase):
                 np.testing.assert_allclose(forecast.series.values, [0, 0, 0, 0, 10, 10, 10], atol=1e-4)
                 self.assertEqual(len(forecast.runs), 2)
                 self.assertEqual(opened.call_count, 6)  # Four old files, two eligible new files.
+
+    def test_superseded_point_frames_skip_weather_but_keep_map_times_and_old_gaps(self):
+        self.add_coordinates()
+        time = datetime(2024, 12, 23, 22, tzinfo=timezone.utc)
+        old = self.root / '2024122312' / 'wrfout_old'
+        new = self.root / '2024122320' / 'wrfout_new'
+        for path in (old, new):
+            path.parent.mkdir()
+            path.write_bytes(self.path.read_bytes())
+        with Dataset(old, 'a') as dataset:
+            dataset.variables['T2'][:] = 273.15
+            # The old run covers 22:10, which the newer file does not contain.
+            times = dataset.variables['Times']
+            times.set_auto_chartostring(False)
+            times[1] = np.array(list('2024-12-23_22:10:00'), dtype='S1')
+        with Dataset(new, 'a') as dataset:
+            dataset.variables['T2'][0] = -9999  # Newest missing value must not fall back.
+            dataset.variables['T2'][1] = 283.15
+        source = SourceConfig('wrf', 'wrf', self.root, ('wrfout_*',), 'UTC', True)
+        config = Config((source,), self.root / 'unused', 'UTC',
+                        points=(PointConfig('test', 87.01, 43.01),),
+                        metrics=(('temperature_2m', MetricsOptions()),),
+                        period=PeriodConfig(time, time + timedelta(minutes=10)))
+        # Exclude the source fixture; retain arbitrary file order to exercise run scheduling.
+        indices, messages = {}, []
+        locator = WrfPointLocator(((87.01, 43.01),))
+        with patch('wrf_evaluate.forecasts.iter_source_files', return_value=iter((old, new))), patch(
+            'wrf_evaluate.wrf.WrfPointLocator.locate', wraps=locator.locate,
+        ) as locate:
+            forecast = _wrf_series(source, config, messages.append, map_frames=indices)['test', 'temperature_2m']
+        self.assertEqual(locate.call_count, 3)  # Four metadata times, only three coordinate/value reads.
+        self.assertEqual(forecast.series.times, (time, time + timedelta(minutes=5), time + timedelta(minutes=10)))
+        self.assertIsNone(forecast.series.values[0])
+        np.testing.assert_allclose(forecast.series.values[1:], (10, 0), atol=1e-4)
+        self.assertEqual(sum(map(len, indices.values())), 4)
+        self.assertIn((old, 0), [frame for run in indices.values() for frame in run.values()])
+        self.assertTrue(any('跳过 1 个被较新起报覆盖' in message for message in messages))
+
+        # Conflicts in an older run still fail, even if a newer run covers the timestamp.
+        duplicate = old.with_name('wrfout_duplicate')
+        duplicate.write_bytes(old.read_bytes())
+        with patch('wrf_evaluate.forecasts.iter_source_files', return_value=iter((new, old, duplicate))):
+            with self.assertRaisesRegex(ValueError, '同一起报有重复时次'):
+                _wrf_series(source, config)
+
+    def test_mixed_fields_skip_old_temperature_but_keep_each_run_rainfall(self):
+        self.add_coordinates()
+        start = datetime(2024, 12, 23, 22, tzinfo=timezone.utc)
+        old = self.root / '2024122300' / 'wrfout_old'
+        new = self.root / '2024122312' / 'wrfout_new'
+        for path, readings in ((old, (100, 101)), (new, (0, 2))):
+            path.parent.mkdir()
+            path.write_bytes(self.path.read_bytes())
+            with Dataset(path, 'a') as dataset:
+                times = dataset.variables['Times']
+                times.set_auto_chartostring(False)
+                times[:] = stringtochar(np.array([
+                    '2024-12-23_22:00:00', '2024-12-23_23:00:00',
+                ], dtype='S19'))
+                rain = dataset.createVariable('RAINNC', 'f4', ('Time', 'south_north', 'west_east'))
+                rain.units = 'mm'
+                rain[0], rain[1] = readings
+                dataset.variables['T2'][:] = 283.15
+                if path == old:
+                    # Prove superseded instant fields are not even requested.
+                    dataset.renameVariable('T2', 'unused_temperature')
+        source = SourceConfig(
+            'wrf', 'wrf', self.root, ('wrfout_*',), 'UTC', True,
+            variable_mapping=(('precipitation', VariableConfig('RAINNC', time_kind='cumulative')),),
+        )
+        config = Config(
+            (source,), self.root / 'unused', 'UTC',
+            points=(PointConfig('test', 87.01, 43.01),),
+            metrics=tuple((element, MetricsOptions()) for element in ('temperature_2m', 'precipitation')),
+            period=PeriodConfig(start, start + timedelta(hours=1)),
+        )
+        indices, messages = {}, []
+        with patch('wrf_evaluate.forecasts.iter_source_files', return_value=iter((old, new))):
+            result = _wrf_series(source, config, messages.append, map_frames=indices)
+        temperature = result['test', 'temperature_2m']
+        rainfall = result['test', 'precipitation']
+        np.testing.assert_allclose(temperature.series.values, (10, 10), atol=1e-4)
+        self.assertEqual(len(temperature.runs), 1)
+        self.assertEqual(rainfall.series.values, (2,))
+        self.assertEqual(sorted(curve.values for _, curve in rainfall.runs), [(1,), (2,)])
+        self.assertEqual(sum(map(len, indices.values())), 4)
+        self.assertTrue(any('跳过 2 个被较新起报覆盖' in message and '时段字段仍保留完整批次' in message
+                            for message in messages))
 
     def test_point_frames_keep_missing_values_and_relocate_moving_grid(self):
         self.add_coordinates()
@@ -400,6 +490,9 @@ class WrfReaderTests(unittest.TestCase):
             read_wrf_header(self.path)
 
     def test_missing_model_start_time_is_not_invented(self):
+        with Dataset(self.path, 'a') as dataset:
+            dataset.SIMULATION_START_DATE = ''
+        self.assertEqual(read_wrf_header(self.path).model_start_time.hour, 21)
         with Dataset(self.path, "a") as dataset:
             dataset.delncattr("SIMULATION_START_DATE")
         self.assertEqual(read_wrf_header(self.path).model_start_time.hour, 21)
@@ -419,10 +512,15 @@ class WrfReaderTests(unittest.TestCase):
 
     def test_inspect_uses_config_without_creating_output(self):
         config = self.root / "config.toml"
-        config.write_text('''[output]
+        config.write_text('''source_config = "sources.toml"
+[output]
 directory = "../result"
 timezone = "UTC"
-[sources.wrf]
+[[plots]]
+element = "temperature_2m"
+type = "map"
+''', encoding="utf-8")
+        (self.root / "sources.toml").write_text('''[sources.wrf]
 kind = "wrf"
 root = "."
 patterns = ["wrfout_*"]

@@ -1,137 +1,149 @@
-# root 和输出目录的相对路径以本配置文件所在目录为基准；files 相对于来源 root。
-# 部署 Linux 时，将 F:/... 替换为服务器上的实际路径。
-# 本阶段 check/scan 均只读，不创建输出目录、不读取数据内容。
-
-# 本次输出的统一要素名；增加要素时，请同时配置其 WRF 和实况映射。
-elements = ["temperature_2m"]
-
-[output]
-directory = "output"  # 可省略，默认 output；每次运行创建独立的 name_运行时间 子目录
-name = "wrf-test"  # 可省略，默认 evaluate
-timezone = "Asia/Shanghai"  # 可省略，默认北京时间；不影响来源数据的时间解释
-
-[display_names]
-# 程序要素 -> 图中显示名称；可整表省略，也可仅覆盖需要改名的项。
-temperature_2m = "2m气温"
+# 服务器运行入口；稳定的数据路径、时区和字段定义放在来源文件中。
+source_config = "config.sources.toml"
 
 [period]
-# 绘图和指标共同使用的起止时刻，包含端点；+08:00 为北京时间，Z 为 UTC。
+# 时间须含时区：+08:00为北京时间，Z或+00:00为UTC；以下两行与当前时段等价。
+# start = "2024-12-01T04:00:00Z"
+# end = "2024-12-07T04:00:00Z"
 start = "2024-12-01T12:00:00+08:00"
 end = "2024-12-07T12:00:00+08:00"
 
-[matching]
-time_tolerance_seconds = 60  # 瞬时指标最近时刻一对一配对；时段量比较完整相同区间；绘图不重采样
+[output]
+directory = "output"
+name = "wrf-test"
+timezone = "Asia/Shanghai"
 
-[maps]
-# 空间填色图使用 period 的起止时间，从 start 起每隔该时长输出一组图。
-interval = "12h"
-
-[metrics]
-# 雨量 >= 阈值即事件，单位 mm。填写业务阈值后使用；空数组表示不计算降水事件率。
-# 仅比较同一起止时段的雨量；不将不同时长的事件混合统计。
-precipitation_thresholds_mm = []
-
-# 点位由你直接填写，程序不读取位置 Excel；复制此块即可添加点位。
-# 名称不可重复；经纬度使用十进制度。下面保留一个已核对的样例点。
-[[points]]
+[[station]]
 name = "水西沟"
 longitude = 87.4897
 latitude = 43.4733
-station_id = "Y5012"  # 仅与站点实测 Excel 对比时使用；点位名称可自行命名
+time_tolerance_seconds = 60 # 默认60，非负整数秒；0严格同刻。只影响瞬时指标配对。
 
-[sources.wrf]
-kind = "wrf"
-root = "/lustre/share/slurm_wrf_ice/output"
-patterns = ["wrfout_d03*"]
-timezone = "UTC"
-# 自动递归查找 root 下的文件；yyyymmddhh 目录名按此 timezone 作为起报时间。
-# 平铺文件回退读取 SIMULATION_START_DATE，缺少时读取 START_DATE；无需逐文件填写。
-min_lead_hours = 6  # 默认 0；例如设为 6，排除 lead time < 6h，6h 端点保留
-max_lead_hours = 168  # 默认 7 天；筛掉过旧起报目录及文件内超出此时效的时次
-# 仅目录和文件属性均不能表示业务起报时，可显式覆盖平铺文件：
-# init_time = "2024-12-23T12:00:00Z"
+# Excel必填；文件缺失会在运行前报错；不自动搜索文件。
+# station_id = "Y5012" # 可选：单站表自动读取站号，多站表须显式填写以筛选。
+# files支持绝对路径或相对本运行配置的路径；一个站点可明确列出多个文件。
+excel.files = ["/home/wrfadmin/user/zhangxf/wrf-evaluate/data/region/Y5012_乌鲁木齐县水西沟镇气象观测站_10.8_16.8.xls"]
+excel.timezone = "UTC" # 观测原始时区；其他数据按实际改为Asia/Shanghai等。
+excel.sheet = "气象数据" # 默认“气象数据”；当前支持A1表头的长表。
+excel.time_format = "%Y%m%d%H%M%S" # 文本时间格式；也可用 "%Y-%m-%d %H:%M:%S"，Excel日期单元格自动识别。
+excel.missing_values = [] # 字符串/数值缺测标记，例[-9999, "M"]；默认[]，只填数据实际使用的标记。
+# 每个站点独立配置表头；省略的已知字段沿用样例默认定义。
+excel.variables.station_id = { variable = "区站号" }
+excel.variables.time = { variable = "观测时间" }
+excel.variables.temperature_2m = { variable = "气温(°)", units = "degC", time_kind = "instant" }
+excel.variables.relative_humidity_2m = { variable = "相对湿度(%RH)", units = "%", time_kind = "instant" }
+# wind_speed按指定列读取；换成其他平均/瞬时风速列时同步调整时间含义。
+excel.variables.wind_speed = { variable = "10min平均风速(m/s)", units = "m/s", time_kind = "mean", interval = "10min", timestamp = "end" }
+# window可选hour_to_date（本小时累计，整点为前一小时总量）或rolling（过去interval时长）。
+excel.variables.precipitation = { variable = "小时降水量(mm)", units = "mm", time_kind = "sum", interval = "1h", timestamp = "end", window = "hour_to_date" }
 
-[sources.wrf.variables]
-# 左侧固定为统一要素英文名；variable 指定一个 NetCDF 字段。
-# wind_speed_10m 默认由 U10/V10 合成；需要改名时使用 components = ["U10", "V10"]。
-# units 省略时使用 NetCDF 的 units 属性；time_kind 默认 instant。
-[sources.wrf.variables.temperature_2m]
-variable = "T2"
+[[station]]
+name = "水西沟镇东梁村"
+longitude = 87.5289
+latitude = 43.4503
+time_tolerance_seconds = 60
+excel.files = ["/home/wrfadmin/user/zhangxf/wrf-evaluate/data/region/Y5056_乌鲁木齐县水西沟镇东梁村气象观测站_13.5_23.7.xls"]
+excel.timezone = "UTC"
+excel.sheet = "气象数据"
+excel.time_format = "%Y%m%d%H%M%S" # 文本时间格式；也可用 "%Y-%m-%d %H:%M:%S"，Excel日期单元格自动识别。
+excel.missing_values = [] # 字符串/数值缺测标记，例[-9999, "M"]；默认[]，只填数据实际使用的标记。
+excel.variables.station_id = { variable = "区站号" }
+excel.variables.time = { variable = "观测时间" }
+excel.variables.temperature_2m = { variable = "气温(°)", units = "degC", time_kind = "instant" }
+excel.variables.relative_humidity_2m = { variable = "相对湿度(%RH)", units = "%", time_kind = "instant" }
+excel.variables.wind_speed = { variable = "10min平均风速(m/s)", units = "m/s", time_kind = "mean", interval = "10min", timestamp = "end" }
+excel.variables.precipitation = { variable = "小时降水量(mm)", units = "mm", time_kind = "sum", interval = "1h", timestamp = "end", window = "hour_to_date" }
 
-# 将 relative_humidity_2m 加入 elements 即启用湿度，输入字段可在这里修改。
-# 同刻混合比、温度、气压；液态水基准，计算结果限制在 0–100%。
-[sources.wrf.variables.relative_humidity_2m.inputs]
-mixing_ratio = { variable = "Q2" }
-temperature = { variable = "T2" }
-pressure = { variable = "PSFC" }
+[[plots]]
+element = "temperature_2m"
+type = "series"
+# element可选：temperature_2m、relative_humidity_2m、wind_speed、precipitation、
+# surface_shortwave_down、surface_longwave_down；type可选series/map。
+figsize = [11, 4.8] # 英寸；series默认[11, 4.8]。
+dpi = 160 # 正整数，默认160。
+# y_limits = [-30, 10] # 可选：纵轴范围，采用要素统一单位；省略自动缩放。
 
-# 若需要降水，将 precipitation 加入文件顶部 elements，并取消以下注释。
-# 指定哪个变量就只读哪个变量，不自动将分量求和。
-# [sources.wrf.variables.precipitation]
-# variable = "RAINNC"
-# time_kind = "cumulative"
+[[plots]]
+element = "temperature_2m"
+type = "map"
+layout = "timeline" # timeline：所有时刻同图，每行一个时刻；separate：每时刻单独出图。
+interval = "12h" # 正整数+s/min/h/d，如30min、6h；省略默认6h，从period.start开始。
+figsize = [12, 5] # 英寸：整图宽度、每行高度；默认[12, 5]，汇总图总高度随行数增加。
+dpi = 160 # 正整数，默认160。
+cmap = "viridis" # 默认viridis；可用coolwarm、RdBu_r、turbo等Matplotlib色表。
+difference_cmap = "RdBu_r" # 差值色表，默认RdBu_r；可用coolwarm等。
+# difference_limit = 5 # 可选：所有时刻差值共用[-5, 5]色标，采用要素统一单位；省略自动对称取值。
+# color_limits = [-30, 10] # 可选：所有时刻预报/实况共用色标范围；省略自动取值。
+# interval是出图间隔，不是降水累计窗口；窗口由来源字段定义。
 
-[sources.cldas]
-kind = "cldas"
-root = "/nas/nas1/Datasets/yl_qx/CMA/CLDAS/CLDAS-V2-HOR-NRT/2024"
-patterns = ["*.nc"]
-timezone = "UTC"
+[[metrics]]
+element = "temperature_2m"
+# 容差在[[station]]中配置。
+# 复制[[plots]]/[[metrics]]增加任务；删除或整组注释即取消，无enabled开关。
 
-[sources.cldas.variables]
-# product 是文件名中的 CLDAS 产品代码，variable 是文件内部的场名。
-[sources.cldas.variables.temperature_2m]
-product = "TMP"
-variable = "TAIR"
+[[plots]]
+element = "relative_humidity_2m"
+type = "series"
+figsize = [11, 4.8] # 英寸。
+dpi = 160
+# y_limits = [0, 100] # 可选，单位%；省略自动缩放。
 
-# 同刻比湿、温度、气压；各产品独立选最新制作版本，缺同刻输入保留缺测。
-[sources.cldas.variables.relative_humidity_2m.inputs]
-specific_humidity = { variable = "QAIR", product = "SHU" }
-temperature = { variable = "TAIR", product = "TMP" }
-pressure = { variable = "PAIR", product = "PRS" }
+[[plots]]
+element = "relative_humidity_2m"
+type = "map"
+layout = "timeline" # timeline：所有时刻同图，每行一个时刻；separate：每时刻单独出图。
+interval = "6h" # 正整数+s/min/h/d，默认6h。
+figsize = [12, 5] # 英寸：整图宽度、每行高度；默认[12, 5]，汇总图总高度随行数增加。
+dpi = 160
+cmap = "viridis" # Matplotlib色表，如coolwarm、RdBu_r、turbo。
+difference_cmap = "RdBu_r" # 差值色表，默认RdBu_r；可用coolwarm等。
+# difference_limit = 5 # 可选：所有时刻差值共用[-5, 5]色标，采用要素统一单位；省略自动对称取值。
+# color_limits = [0, 100] # 可选：所有时刻预报/实况共用色标范围；省略自动取值。
 
-# [sources.cldas.variables.precipitation]
-# product = "PRE"
-# variable = "PRCP"
-# time_kind = "sum"
-# interval = "1h"
-# timestamp = "end"
-# units 省略时使用文件属性；样例 PRCP 为 mm/h，乘以明确配置的时长后变成 mm。
+[[metrics]]
+element = "relative_humidity_2m"
 
-[sources.regional]
-kind = "regional"
-root = "/home/wrfadmin/user/zhangxf/wrf-evaluate/data/region"
-# 只读取你明确列出的 Excel，不遍历目录、不按站号猜文件名。
-# 在 root 下填写完整的相对路径，例如 files = ["2024/excel/实际文件名.xlsx"]。
-files = ["Y5012_乌鲁木齐县水西沟镇气象观测站_10.8_16.8.xls"]
-timezone = "UTC"  # 跨年样例推断，尚不代表所有文件均已核验
+[[plots]]
+element = "wind_speed"
+type = "series"
+figsize = [11, 4.8]
+dpi = 160
+# y_limits = [0, 20] # 可选，单位m/s；省略自动缩放。
 
-[sources.regional.variables]
-# variable 是 Excel 表头；Excel 没有单位元数据，必须填写 units。
-[sources.regional.variables.station_id]
-variable = "区站号"
-[sources.regional.variables.time]
-variable = "观测时间"
-[sources.regional.variables.temperature_2m]
-variable = "气温(°)"
-units = "degC"
-time_kind = "instant"
-[sources.regional.variables.relative_humidity_2m]
-variable = "相对湿度(%RH)"
-units = "%"
-time_kind = "instant"
-[sources.regional.variables.wind_speed_10m]
-variable = "10min平均风速(m/s)"
-units = "m/s"
-time_kind = "mean"
-interval = "10min"
-timestamp = "end"
+[[plots]]
+element = "wind_speed"
+type = "map"
+layout = "timeline" # timeline：所有时刻同图，每行一个时刻；separate：每时刻单独出图。
+interval = "6h"
+figsize = [12, 5] # 英寸：整图宽度、每行高度；默认[12, 5]，汇总图总高度随行数增加。
+dpi = 160
+cmap = "viridis"
+difference_cmap = "RdBu_r" # 差值色表，默认RdBu_r；可用coolwarm等。
+# difference_limit = 5 # 可选：所有时刻差值共用[-5, 5]色标，采用要素统一单位；省略自动对称取值。
+# color_limits = [0, 20] # 可选：所有时刻预报/实况共用色标范围；省略自动取值。
 
-# 把 precipitation 加入顶部 elements 后，区域站默认按原始记录作图，不参与站点降水指标。
-# 只有确认 Excel 记录的雨量窗口后，才设 time_kind = "sum" 并补齐 interval、timestamp。
-[sources.regional.variables.precipitation]
-variable = "小时降水量(mm)"
-units = "mm"
-time_kind = "raw"  # 按原值绘图，不做差分；不假设区间，不参与站点降水指标
+[[metrics]]
+element = "wind_speed"
 
-# 未来可加入 EC 或更多 WRF 试验；名称自定，kind 表示数据类型。
-# 暂不使用的来源可设置 enabled = false，此时不检查其目录。
+[[plots]]
+element = "precipitation"
+type = "series"
+figsize = [11, 4.8]
+dpi = 160
+# y_limits = [0, 20] # 可选，单位mm；省略自动缩放。
+
+[[plots]]
+element = "precipitation"
+type = "map"
+layout = "timeline" # timeline：所有时刻同图，每行一个时刻；separate：每时刻单独出图。
+interval = "6h" # 出图频率；雨量窗口由来源字段定义。
+figsize = [12, 5] # 英寸：整图宽度、每行高度；默认[12, 5]，汇总图总高度随行数增加。
+dpi = 160
+cmap = "Blues"
+difference_cmap = "RdBu_r" # 差值色表，默认RdBu_r；可用coolwarm等。
+# difference_limit = 5 # 可选：所有时刻差值共用[-5, 5]色标，采用要素统一单位；省略自动对称取值。
+# color_limits = [0, 20] # 可选：所有时刻预报/实况共用色标范围；省略自动取值。
+
+[[metrics]]
+element = "precipitation"
+precipitation_thresholds_mm = [0.1, 1, 10] # 达到阈值即事件；默认[]，不统计降水事件率。

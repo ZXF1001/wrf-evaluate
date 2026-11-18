@@ -1,0 +1,53 @@
+# 数据源、字段定义
+
+[sources.wrf]
+# 递归扫描；yyyymmddhh 目录为起报时间，按来源 timezone 解释。
+# 平铺文件读 SIMULATION_START_DATE/START_DATE；必要时可设 init_time。
+# 同一有效时刻选最新合格批次；lead_hours 默认 [0, 168]，单位小时，包含两端。
+kind = "wrf"
+root = "/lustre/share/slurm_wrf_ice/output"
+patterns = ["wrfout_d03*"]
+timezone = "UTC"
+lead_hours = [6, 168]
+
+[sources.cldas]
+kind = "cldas"
+root = "/nas/nas1/Datasets/yl_qx/CMA/CLDAS/CLDAS-V2-HOR-NRT/2024"
+patterns = ["*.nc"]
+timezone = "UTC"
+
+[elements.temperature_2m]
+name = "2m气温"
+sources.wrf.variable = "T2"
+sources.cldas.product = "TMP"
+sources.cldas.variable = "TAIR"
+
+[elements.relative_humidity_2m]
+# WRF 为混合比，CLDAS 为比湿；各输入可单独覆盖 units。
+# 液态水基准计算，相对湿度限制在0–100%。
+sources.wrf.inputs.mixing_ratio.variable = "Q2"
+sources.wrf.inputs.temperature.variable = "T2"
+sources.wrf.inputs.pressure.variable = "PSFC"
+sources.cldas.inputs.specific_humidity.variable = "QAIR"
+sources.cldas.inputs.specific_humidity.product = "SHU"
+sources.cldas.inputs.temperature.variable = "TAIR"
+sources.cldas.inputs.temperature.product = "TMP"
+sources.cldas.inputs.pressure.variable = "PAIR"
+sources.cldas.inputs.pressure.product = "PRS"
+
+[elements.wind_speed]
+sources.wrf.components = ["U10", "V10"]
+sources.cldas.variable = "WIND"
+sources.cldas.product = "WIN"
+# WRF 合成10m瞬时风速；站点采用10分钟平均风速。
+
+[elements.precipitation]
+# variable 只选一个降水字段，不自动相加。WRF累计量按同批次差分。
+# RAINNC 是网格尺度降水；如需其他分量，请更换 variable。
+sources.wrf.variable = "RAINNC"
+sources.wrf.time_kind = "cumulative"
+sources.cldas.variable = "PRCP"
+sources.cldas.product = "PRE"
+sources.cldas.time_kind = "sum"
+sources.cldas.interval = "1h"
+sources.cldas.timestamp = "end"

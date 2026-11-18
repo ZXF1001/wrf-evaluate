@@ -111,10 +111,15 @@ class CldasReaderTests(unittest.TestCase):
 
     def test_cldas_only_inspect_works_without_creating_output(self):
         config = self.root / "config.toml"
-        config.write_text('''[output]
+        config.write_text('''source_config = "sources.toml"
+[output]
 directory = "../result"
 timezone = "UTC"
-[sources.cldas]
+[[plots]]
+element = "temperature_2m"
+type = "map"
+''', encoding="utf-8")
+        (self.root / "sources.toml").write_text('''[sources.cldas]
 kind = "cldas"
 root = "."
 patterns = ["*.nc"]

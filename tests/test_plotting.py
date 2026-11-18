@@ -1,17 +1,18 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import tempfile
+from io import BytesIO
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from matplotlib import font_manager
 from matplotlib.dates import date2num
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-from wrf_evaluate.config import PointConfig
-from wrf_evaluate.plotting import plot_series
+from wrf_evaluate.config import PointConfig, SeriesOptions
+from wrf_evaluate.plotting import plot_series, plot_style
 from wrf_evaluate.series import Series
 
 
@@ -19,6 +20,12 @@ class SeriesPlotTests(unittest.TestCase):
     def setUp(self):
         self.time = datetime(2024, 12, 24, tzinfo=timezone.utc)
         self.point = PointConfig("Y5012", 87.4897, 43.4733)
+
+    def test_bundled_font_is_registered_for_plots(self):
+        style = plot_style()
+        selected = Path(font_manager.findfont(font_manager.FontProperties(family=style["font.family"])))
+        self.assertEqual(selected.resolve(), (Path(__file__).parents[1] / "fonts" / "SimHei.ttf").resolve())
+        self.assertFalse(style["axes.unicode_minus"])
 
     def test_native_minutes_and_hours_share_one_axes_with_missing_gap(self):
         wrf = Series("WRF", (self.time, self.time + timedelta(hours=1)), (-12, -10))
@@ -34,7 +41,7 @@ class SeriesPlotTests(unittest.TestCase):
 
         def capture_save(figure, *args, **kwargs):
             ax = figure.axes[0]
-            result = original_save(figure, *args, **kwargs)
+            result = original_save(figure, rendered, **kwargs)
             labels.update(
                 title=ax.get_title(), ylabel=ax.get_ylabel(), xlabel=ax.get_xlabel(),
                 legend=[text.get_text() for text in ax.get_legend().get_texts()],
@@ -43,11 +50,10 @@ class SeriesPlotTests(unittest.TestCase):
             )
             return result
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "temperature.png"
-            with patch.object(Axes, "plot", capture), patch.object(Figure, "savefig", capture_save):
-                self.assertEqual(plot_series(path, self.point, [wrf, obs], "Asia/Shanghai"), path)
-            self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        path, rendered = Path("temperature.png"), BytesIO()
+        with patch.object(Axes, "plot", capture), patch.object(Figure, "savefig", capture_save):
+            self.assertEqual(plot_series(path, self.point, [wrf, obs], "Asia/Shanghai"), path)
+        self.assertEqual(rendered.getvalue()[:8], b"\x89PNG\r\n\x1a\n")
         self.assertIs(calls[0][0], calls[1][0])
         self.assertEqual([len(call[1]) for call in calls], [2, 3])
         self.assertEqual(calls[0][1][0].hour, 8)
@@ -72,6 +78,20 @@ class SeriesPlotTests(unittest.TestCase):
         ):
             with self.subTest(times=times, values=values), self.assertRaises(ValueError):
                 Series("test", times, values)
+
+    def test_long_regular_sampling_gap_breaks_line_without_removing_native_points(self):
+        times = tuple(self.time + timedelta(hours=i) for i in (0, 1, 2, 10, 11))
+        curve = Series('WRF', times, (0, 1, 2, 10, 11))
+        original = Axes.plot
+        captured = []
+        def capture(ax, times, values, **kwargs):
+            captured.append((times, values))
+            return original(ax, times, values, **kwargs)
+        with patch.object(Axes, 'plot', capture), patch.object(Figure, 'savefig'):
+            plot_series('unused.png', self.point, [curve], 'UTC')
+        plotted_times, plotted_values = captured[0]
+        self.assertTrue(np.isnan(plotted_values[3]))
+        self.assertEqual([time for time, value in zip(plotted_times, plotted_values) if not np.isnan(value)], list(times))
 
     def test_empty_plot_and_duplicate_labels_are_rejected(self):
         empty = Series("empty", (self.time,), (None,))
@@ -98,10 +118,12 @@ class SeriesPlotTests(unittest.TestCase):
             self.assertEqual(str(figure.axes[0].xaxis.get_major_locator().tz), "Asia/Shanghai")
             self.assertIn('自定义气温对比', figure.axes[0].get_title())
             self.assertEqual(figure.axes[0].get_ylabel(), '自定义气温（℃）')
+            self.assertEqual(figure.axes[0].get_ylim(), (-30, 10))
+            np.testing.assert_allclose(figure.get_size_inches(), (8, 3))
+            self.assertEqual(kwargs['dpi'], 120)
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "temperature.png"
-            with patch.object(Figure, "savefig", capture):
-                plot_series(path, self.point, [series], "Asia/Shanghai", period=period, element_name='自定义气温')
+        with patch.object(Figure, "savefig", capture):
+            plot_series("temperature.png", self.point, [series], "Asia/Shanghai", period=period,
+                        element_name='自定义气温', options=SeriesOptions((8, 3), 120, (-30, 10)))
         self.assertEqual(len(limits), 1)
         np.testing.assert_allclose(limits[0], date2num([period.start, period.end]))

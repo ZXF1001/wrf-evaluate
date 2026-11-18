@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
 
-from .variables import UNITS, VariableConfig, convert_value, validate_variable
+from .variables import UNITS, VariableConfig, convert_value, normalized_statistic, validate_variable
 from .config import PeriodConfig
 
 
@@ -27,18 +27,18 @@ class Series:
             raise ValueError(f"{self.label}: 时间须严格递增，重复记录须先核实来源")
         if any(value is not None and (isinstance(value, bool) or not math.isfinite(value)) for value in self.values):
             raise ValueError(f"{self.label}: 数值须为有限值或 None")
-        if self.statistic not in {"instant", "mean", "sum", "raw"}:
-            raise ValueError("标准化后的统计方式应为 instant / mean / sum / raw")
-        if self.statistic in {"instant", "raw"} and self.bounds:
-            raise ValueError("瞬时值或未分类原始值不应含时段边界")
-        if self.statistic not in {"instant", "raw"}:
+        if self.statistic not in {"instant", "mean", "sum"}:
+            raise ValueError("标准化后的统计方式应为 instant / mean / sum")
+        if self.statistic == "instant" and self.bounds:
+            raise ValueError("瞬时值不应含时段边界")
+        if self.statistic != "instant":
             if len(self.bounds) != len(self.times):
                 raise ValueError("时段序列须为每个值保留起止边界")
             for start, end in self.bounds:
                 if start.utcoffset() is None or end.utcoffset() is None or end <= start:
                     raise ValueError("时段边界须包含时区，且结束晚于开始")
-            if any(b[0] <= a[0] or b[1] <= a[1] for a, b in zip(self.bounds, self.bounds[1:])):
-                raise ValueError("时段起点和终点须分别严格递增，不可重复或嵌套")
+            if any(b[0] < a[0] or b[1] <= a[1] for a, b in zip(self.bounds, self.bounds[1:])):
+                raise ValueError("时段起点不能回退，终点须严格递增")
 
 
 def normalize_series(
@@ -55,7 +55,7 @@ def normalize_series(
     times, values, bounds = [], [], []
     previous = None
     radiation_energy = field.startswith("surface_") and spec.time_kind in {"sum", "cumulative"}
-    statistic = "mean" if radiation_energy else "sum" if spec.time_kind == "cumulative" else spec.time_kind
+    statistic = normalized_statistic(field, spec)
     for time, value, original_units, location in records:
         try:
             value = convert_value(field, value, spec.units or original_units, spec.time_kind, spec.interval)
@@ -72,15 +72,20 @@ def normalize_series(
             elif spec.time_kind in {"mean", "sum"}:
                 start = time if spec.timestamp == "start" else time - spec.interval
                 end = start + spec.interval
+                if spec.window == "hour_to_date":
+                    start = time.replace(minute=0, second=0, microsecond=0)
+                    if start == time:
+                        start -= timedelta(hours=1)
+                    end = time
             if radiation_energy and value is not None:
                 value /= (end - start).total_seconds()
             # 时段量仅保留完整落入检验范围的区间，不能裁剪后仍使用完整区间值。
-            inside = (period.start <= time <= period.end if statistic in {"instant", "raw"}
+            inside = (period.start <= time <= period.end if statistic == "instant"
                       else period.start <= start < end <= period.end)
             if inside:
                 times.append(time)
                 values.append(value)
-                if statistic not in {"instant", "raw"}:
+                if statistic != "instant":
                     bounds.append((start, end))
         except ValueError as exc:
             raise ValueError(f"{label} {location}: {exc}") from exc

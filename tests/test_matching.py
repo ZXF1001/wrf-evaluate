@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from wrf_evaluate.cldas import CldasReadError, parse_cldas_filename
 from wrf_evaluate.cli import main
-from wrf_evaluate.config import Config, PeriodConfig, SourceConfig
+from wrf_evaluate.config import Config, PeriodConfig, PointConfig, SourceConfig
 from wrf_evaluate.matching import TimeMatchError, index_cldas_files, iter_time_matches, iter_cldas_input_files
 from wrf_evaluate.variables import DEFAULT_VARIABLES
 from wrf_evaluate.wrf import WrfHeader
@@ -93,6 +93,18 @@ class TimeMatchingTests(unittest.TestCase):
         index = index_cldas_files((self.cldas,), product='TMP', period=period)
         self.assertEqual(len(index), 1)
         self.assertEqual(index[('analysis', 'NRT_ASI_0P0625', 'TMP')][1][0].path, self.observation)
+
+    def test_cldas_index_can_ignore_products_unused_by_selected_outputs(self):
+        rain = self.cldas_path(product='PRE')
+        self.files['analysis'] += [rain, Path('duplicate') / rain.name]
+        other = replace(self.cldas, name='other')
+        self.files['other'] = [rain, self.observation, Path('duplicate') / self.observation.name]
+        index = index_cldas_files((self.cldas, other),
+                                  products_by_source={'analysis': {'TMP'}, 'other': {'PRE'}})
+        self.assertEqual(set(index), {('analysis', 'NRT_ASI_0P0625', 'TMP'),
+                                     ('other', 'NRT_ASI_0P0625', 'PRE')})
+        with self.assertRaisesRegex(TimeMatchError, '重复'):
+            index_cldas_files((self.cldas,), products_by_source={'analysis': {'PRE'}})
 
     def test_different_products_families_and_sources_are_not_overwritten(self):
         self.files['analysis'] += [self.cldas_path(product='PRE'), self.cldas_path(family='NRT_CHN_0P0625')]
@@ -181,7 +193,7 @@ class TimeMatchingTests(unittest.TestCase):
 
     def test_cli_match_reports_counts_without_opening_cldas_or_writing_files(self):
         period = PeriodConfig(self.time, self.time + timedelta(minutes=10))
-        config = Config((self.wrf, self.cldas), Path('output'), 'UTC', timedelta(seconds=60), period=period)
+        config = Config((self.wrf, self.cldas), Path('output'), 'UTC', period=period)
         output = StringIO()
         with patch('wrf_evaluate.cli.load_config', return_value=config), \
              patch('wrf_evaluate.matching.iter_wrf_files', return_value=iter([self.forecast])) as paths, \
@@ -191,6 +203,22 @@ class TimeMatchingTests(unittest.TestCase):
         self.assertRegex(output.getvalue(), r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]')
         self.assertIn('配对 1，未配对 0', output.getvalue())
         self.assertIn('最大绝对时差 0 秒', output.getvalue())
+
+    def test_cli_station_tolerances_share_one_file_scan(self):
+        self.headers[self.forecast] = replace(self.headers[self.forecast],
+                                              times=(self.time + timedelta(seconds=30),))
+        points = (PointConfig('strict', 87, 43, time_tolerance=timedelta(0)),
+                  PointConfig('nearby', 87, 43, time_tolerance=timedelta(seconds=60)))
+        config = Config((self.wrf, self.cldas), Path('output'), 'UTC',
+                        points=points)
+        output = StringIO()
+        with patch('wrf_evaluate.cli.load_config', return_value=config), \
+             patch('wrf_evaluate.matching.read_wrf_header', return_value=self.headers[self.forecast]) as read, \
+             redirect_stdout(output):
+            self.assertEqual(main(['match']), 0)
+        read.assert_called_once()
+        self.assertIn('容差 ±0 秒，forecast -> analysis NRT_ASI_0P0625/TMP: 配对 0，未配对 1', output.getvalue())
+        self.assertIn('容差 ±60 秒，forecast -> analysis NRT_ASI_0P0625/TMP: 配对 1，未配对 0', output.getvalue())
 
 
 if __name__ == '__main__':

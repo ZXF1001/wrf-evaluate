@@ -81,7 +81,7 @@ def resolve_wrf_variable(
     if not spec.components:
         return values[spec.variable], units[spec.variable]
     for name in spec.components:
-        convert_value("wind_speed_10m", None, spec.units or units[name], spec.time_kind, spec.interval)
+        convert_value("wind_speed", None, spec.units or units[name], spec.time_kind, spec.interval)
     u, v = (values[name] for name in spec.components)
     speed = None if u is None or v is None else np.hypot(u, v)
     return speed, "m/s"
@@ -112,7 +112,7 @@ def _read_times(dataset: Dataset, zone: ZoneInfo) -> tuple[datetime, ...]:
 
 
 def _model_start_time(dataset: Dataset, zone: ZoneInfo) -> datetime | None:
-    start = getattr(dataset, "SIMULATION_START_DATE", getattr(dataset, "START_DATE", None))
+    start = getattr(dataset, "SIMULATION_START_DATE", None) or getattr(dataset, "START_DATE", None)
     try:
         return datetime.strptime(start, "%Y-%m-%d_%H:%M:%S").replace(tzinfo=zone) if start else None
     except (ValueError, TypeError) as exc:
@@ -299,12 +299,14 @@ def iter_wrf_points_frames(
     min_lead_hours: float = 0,
     max_lead_hours: float = 168,
     locator: WrfPointLocator | None = None,
+    frame_variables: Callable[[datetime, int, datetime | None], Sequence[str]] | None = None,
 ) -> Iterator[tuple[WrfPointFrame, ...]]:
     """一次打开文件，按时次返回所有点位值；坐标读取与定位结果复用。
 
     每帧检查坐标；可传入同一 locator 跨文件复用定位，移动网格重新定位。提前停止遍历时
     须 close() 此生成器或使用 contextlib.closing，保证文件及时关闭。
     指定 period 时包含两个端点，范围外时次不读取坐标或气象场。
+    frame_variables 在时间和时效筛选后选择本帧所需的 names 子集；空序列跳过坐标和取值。
     """
     path = Path(path)
     _validate_names(names)
@@ -331,9 +333,9 @@ def iter_wrf_points_frames(
             if (not np.isfinite(min_lead_hours) or min_lead_hours < 0
                     or not np.isfinite(max_lead_hours) or max_lead_hours <= 0
                     or min_lead_hours > max_lead_hours):
-                raise WrfReadError("预报时效须满足 0 ≤ min_lead_hours ≤ max_lead_hours，且最大时效为正")
+                raise WrfReadError("预报时效须满足 0 ≤ 最小时效 ≤ 最大时效，且最大时效为正")
             if min_lead_hours and run_start is None:
-                raise WrfReadError("min_lead_hours 需要 WRF 文件内或配置中的起报时间")
+                raise WrfReadError("lead_hours 下限大于0时需要 WRF 文件内或配置中的起报时间")
             valid_start = run_start + timedelta(hours=min_lead_hours) if run_start else None
             valid_end = run_start + timedelta(hours=max_lead_hours) if run_start else None
             selected_indices = [
@@ -342,15 +344,25 @@ def iter_wrf_points_frames(
                 and (valid_start is None or time >= valid_start)
                 and (valid_end is None or time <= valid_end)
             ]
-            if not selected_indices:
+            selections = []
+            for index in selected_indices:
+                selected = names if frame_variables is None else frame_variables(times[index], index, model_start_time)
+                if not selected:
+                    continue
+                _validate_names(selected)
+                if not set(selected).issubset(names):
+                    raise WrfReadError("frame_variables 只能选择 names 中已声明的变量")
+                selections.append((index, tuple(selected)))
+            if not selections:
                 return
-            for name in ("XLAT", "XLONG", *names):
+            needed = tuple(dict.fromkeys(name for _, selected in selections for name in selected))
+            for name in ("XLAT", "XLONG", *needed):
                 variable = _ground_variable(dataset, name)
                 if variable.shape[0] != len(times):
                     raise WrfReadError(f"{name} 的时次数与 Times 不一致")
 
-            units = {name: getattr(dataset.variables[name], "units", "") for name in names}
-            for time_index in selected_indices:
+            units = {name: getattr(dataset.variables[name], "units", "") for name in needed}
+            for time_index, selected in selections:
                 time = times[time_index]
                 grid = tuple(np.ma.masked_invalid(dataset.variables[name][time_index, :, :], copy=False)
                              for name in ("XLONG", "XLAT"))
@@ -361,13 +373,14 @@ def iter_wrf_points_frames(
                     key = point.row, point.column
                     if key not in samples:
                         values = {}
-                        for name in names:
+                        for name in selected:
                             value = dataset.variables[name][time_index, point.row, point.column]
                             values[name] = None if np.ma.is_masked(value) or not np.isfinite(value) else float(value)
                         samples[key] = values
+                selected_units = {name: units[name] for name in selected}
                 yield tuple(
                     WrfPointFrame(path, time_index, time, point.row, point.column, point.distance_km,
-                                  samples[point.row, point.column], units, model_start_time,
+                                  samples[point.row, point.column], selected_units, model_start_time,
                                   tuple(float(axis[point.row, point.column]) for axis in grid))
                     for point in locations
                 )

@@ -44,9 +44,16 @@ class SeriesEvaluationTests(unittest.TestCase):
         forecast = self.series('WRF', [0, 1], [None, 2])
         observation = self.series('观测', [0, 1], [1, None])
         result = self.compare(forecast, observation, timedelta(0))
-        self.assertEqual(result.matched_times, 2)
+        self.assertEqual(result.matched_times, 0)
         self.assertEqual(result.metrics.sample_count, 0)
         self.assertIsNone(result.metrics.rmse)
+
+    def test_missing_closest_value_does_not_consume_a_valid_nearby_pair(self):
+        forecast = self.series('WRF', [0, 0.5], [None, 2])
+        observation = self.series('观测', [0], [2])
+        result = self.compare(forecast, observation, timedelta(minutes=1))
+        self.assertEqual(result.metrics.sample_count, 1)
+        self.assertEqual(result.metrics.mae, 0)
 
     def test_csv_is_utf8_excel_friendly_and_contains_blank_metrics_without_samples(self):
         forecast = self.series('WRF', [0], [None])
@@ -59,7 +66,7 @@ class SeriesEvaluationTests(unittest.TestCase):
         content = ''.join(call.args[0] for call in output().write.call_args_list)
         row = next(csv.DictReader(StringIO(content)))
         self.assertEqual(row['实况来源'], '站点实测')
-        self.assertEqual(row['配对时次数'], '1')
+        self.assertEqual(row['配对时次数'], '0')
         self.assertEqual(row['有效样本数'], '0')
         self.assertEqual(row['RMSE(℃)'], '')
         self.assertEqual(row['R'], '')
@@ -71,7 +78,7 @@ class SeriesEvaluationTests(unittest.TestCase):
         forecast = self.series('WRF', [0, 0.5, 2, 3, 4], [0, 9, 1, None, -1])
         observation = self.series('实测', [0, 2, 3, 4], [0, -1, 1, 2])
         result = self.compare(forecast, observation, timedelta(minutes=1))
-        self.assertEqual(result.matched_times, 4)
+        self.assertEqual(result.matched_times, 3)
         self.assertEqual(result.metrics.sample_count, 3)
         self.assertEqual(dict(result.events)['非正温(≤0℃)'].sample_count, 3)
         self.assertEqual(dict(result.events)['正温(>0℃)'].sample_count, 3)
@@ -132,7 +139,7 @@ class SeriesEvaluationTests(unittest.TestCase):
             with self.subTest(tolerance=tolerance), self.assertRaises(ValueError):
                 self.compare(series, series, tolerance)
 
-    def test_no_verified_rain_comparisons_write_header_without_fake_scores(self):
+    def test_empty_comparisons_write_header_without_fake_scores(self):
         output = mock_open()
         with patch.object(Path, 'open', output):
             write_metrics('rain.csv', [], unit='mm')
@@ -211,7 +218,7 @@ class PeriodEvaluationTests(unittest.TestCase):
     def test_only_confirmed_wind_case_allows_instant_against_mean(self):
         instant = Series('instant', (self.start + timedelta(minutes=10),), (2,), unit='m/s')
         mean = Series('mean', instant.times, (1,), ((self.start, instant.times[0]),), 'mean', 'm/s')
-        result, = compare_series(instant, mean, timedelta(0), 'wind_speed_10m')
+        result, = compare_series(instant, mean, timedelta(0), 'wind_speed')
         self.assertEqual(result.metrics.mae, 1)
         with self.assertRaisesRegex(ValueError, '时间含义不同'):
             compare_series(instant, mean, timedelta(0), 'temperature_2m')

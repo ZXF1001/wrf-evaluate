@@ -57,6 +57,39 @@ def nearest_rectilinear_point(
     return GridPoint(row, column, float(distance_km), bool(inside))
 
 
+def sample_rectilinear_grid(longitudes, latitudes, values, target_longitudes, target_latitudes):
+    """向二维目标网格向量化取球面最近格点；源域外和缺测点保持缺测。
+
+    源坐标轴须已由读取器校验为严格单调；不按数值有效性改选邻点。
+    """
+    lons, lats = np.asarray(longitudes), np.asarray(latitudes)
+    lon, lat = np.asarray(target_longitudes), np.asarray(target_latitudes)
+    if lon.shape != lat.shape or np.ma.shape(values) != (lats.size, lons.size):
+        raise SpatialMatchError("源场或目标坐标形状不一致")
+    if min(lons.size, lats.size) < 2 or np.ptp(lons) >= 180:
+        raise SpatialMatchError("源网格须至少 2×2，且经度跨度小于 180°")
+
+    def nearest(axis, targets):
+        ascending = axis[0] < axis[-1]
+        ordered = axis if ascending else axis[::-1]
+        upper = np.searchsorted(ordered, targets).clip(1, ordered.size - 1)
+        lower = upper - 1
+        a = lower if ascending else ordered.size - 1 - lower
+        b = upper if ascending else ordered.size - 1 - upper
+        da, db = np.abs(axis[a] - targets), np.abs(axis[b] - targets)
+        return np.where((da < db) | ((da == db) & (a < b)), a, b)
+
+    columns = nearest(lons, lon)
+    # 给定最近经度后，使球面点积最大的纬度；不能简单以纬度差代替球面距离。
+    delta_lon = np.deg2rad(lons[columns] - lon)
+    optimal_lat = np.rad2deg(np.arctan2(np.sin(np.deg2rad(lat)), np.cos(np.deg2rad(lat)) * np.cos(delta_lon)))
+    rows = nearest(lats, optimal_lat)
+    sampled = np.ma.asarray(values)[rows, columns]
+    outside = ((lon < lons.min()) | (lon > lons.max()) | (lat < lats.min()) | (lat > lats.max())
+               | ~np.isfinite(lon) | ~np.isfinite(lat))
+    return np.ma.masked_where(outside, sampled)
+
+
 def _inside_grid_boundary(longitude: np.ndarray, latitude: np.ndarray, point_lon: float, point_lat: float) -> bool:
     """判断是否落在区域网格最外层格点中心围成的多边形内，包含边界。"""
     boundary_lon = np.concatenate((

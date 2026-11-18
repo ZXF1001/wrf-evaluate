@@ -1,6 +1,7 @@
 """只读 CLDAS 小时产品；文件名提供有效时间，网格场按需加载。"""
 
 from collections.abc import Sequence
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -93,7 +94,7 @@ def parse_cldas_filename(path: str | Path, timezone: str = "UTC") -> CldasFileIn
     return CldasFileInfo(path, match[3], time, production_time, match[2])
 
 
-def read_cldas_header(path: str | Path, timezone: str = "UTC") -> CldasHeader:
+def read_cldas_header(path: str | Path, timezone: str = "UTC", *, _dataset=None) -> CldasHeader:
     """读取有效时间、产品、一维经纬度轴及二维场名称，不加载网格场。
 
     不能使用父目录日期或文件名前面的制作时间作为有效时间；时区由来源配置指定。
@@ -102,7 +103,7 @@ def read_cldas_header(path: str | Path, timezone: str = "UTC") -> CldasHeader:
     info = parse_cldas_filename(path, timezone)
 
     try:
-        with Dataset(path, mode="r") as dataset:
+        with (nullcontext(_dataset) if _dataset is not None else Dataset(path, mode="r")) as dataset:
             latitudes = _read_axis(dataset, "LAT")
             longitudes = _read_axis(dataset, "LON")
             variables = frozenset(
@@ -117,11 +118,11 @@ def read_cldas_header(path: str | Path, timezone: str = "UTC") -> CldasHeader:
 
 
 def read_cldas_field(
-    path: str | Path, name: str, *, selection: tuple[slice, slice] | None = None,
+    path: str | Path, name: str, *, selection: tuple[slice, slice] | None = None, _dataset=None,
 ) -> CldasField:
     """只读取指定 LAT/LON 二维场；保留原单位、轴方向和缺测掩码。"""
     try:
-        with Dataset(path, mode="r") as dataset:
+        with (nullcontext(_dataset) if _dataset is not None else Dataset(path, mode="r")) as dataset:
             if name not in dataset.variables:
                 raise CldasReadError(f"缺少变量 {name}")
             variable = dataset.variables[name]
@@ -131,6 +132,33 @@ def read_cldas_field(
             return CldasField(values, getattr(variable, "units", ""))
     except (CldasReadError, OSError) as exc:
         raise CldasReadError(f"无法读取 CLDAS 文件 {path}: {exc}") from exc
+
+
+class CldasFieldReader:
+    """单个出图时刻内复用文件句柄，坐标和子场读取共用一次打开。"""
+
+    def __init__(self):
+        self.stack = ExitStack()
+        self.datasets = {}
+
+    def _dataset(self, path):
+        path = Path(path)
+        if path not in self.datasets:
+            try:
+                self.datasets[path] = self.stack.enter_context(Dataset(path, mode="r"))
+            except OSError as exc:
+                raise CldasReadError(f"无法读取 CLDAS 文件 {path}: {exc}") from exc
+        return self.datasets[path]
+
+    def header(self, path, timezone):
+        return read_cldas_header(path, timezone, _dataset=self._dataset(path))
+
+    def read(self, path, name, *, selection):
+        return read_cldas_field(path, name, selection=selection, _dataset=self._dataset(path))
+
+    def close(self):
+        self.stack.close()
+        self.datasets.clear()
 
 
 def read_cldas_point(

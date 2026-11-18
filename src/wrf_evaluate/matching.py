@@ -1,7 +1,7 @@
 """按有效时间查找 WRF—CLDAS 对应文件；不读取气象场、不计算指标。"""
 
 from bisect import bisect_left
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,25 +47,31 @@ class TimeMatch:
 def index_cldas_files(
     sources: Iterable[SourceConfig], *, product: str | None = None,
     period: PeriodConfig | None = None, progress: Callable[[str], None] | None = None,
+    products_by_source: Mapping[str, set[str]] | None = None,
 ) -> dict:
     """按来源/产品系列/有效时间选择最新制作版本，仅索引路径；可限定产品和时段。"""
     # 只索引来源/产品/时间及路径，不打开 CLDAS 文件或保留网格数组。
     groups: dict[tuple[str, str, str], dict[datetime, tuple[CldasFileInfo, Path | None]]] = {}
     for source in sources:
+        products = products_by_source.get(source.name, set()) if products_by_source is not None else None
+        if products is not None and not products:
+            continue
         found = False
         count = 0
         last_report = monotonic() - 5
         if progress is not None:
-            progress(f"扫描 CLDAS 来源 {source.name}…")
+            progress(f"扫描 CLDAS 来源 {source.name} 的文件名…")
         for path in iter_source_files(source):
             found = True
             count += 1
             now = monotonic()
             if progress is not None and (count == 1 or now - last_report >= 5):
-                progress(f"索引 CLDAS 文件：已处理 {count:,} 个")
+                progress(f"扫描 CLDAS 文件名：已处理 {count:,} 个")
                 last_report = now
             info = parse_cldas_filename(path, source.timezone)
             if product is not None and info.product != product:
+                continue
+            if products is not None and info.product not in products:
                 continue
             if period is not None and not period.start <= info.time <= period.end:
                 continue
@@ -80,7 +86,7 @@ def index_cldas_files(
         if not found:
             raise TimeMatchError(f"sources.{source.name}: 未找到 CLDAS 文件，请检查 root 和 patterns")
         if progress is not None:
-            progress(f"CLDAS 来源 {source.name} 索引完成：检查 {count:,} 个文件")
+            progress(f"CLDAS 来源 {source.name} 文件名索引完成：检查 {count:,} 个文件；未打开网格数据")
 
     index = {}
     for key, versions in groups.items():

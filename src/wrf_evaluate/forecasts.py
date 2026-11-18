@@ -1,5 +1,6 @@
 """WRF 起报时间与批次选择；目录约定由配置来源时区解释。"""
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -43,7 +44,7 @@ def forecast_init_time(
     start = next(iter(starts), source.init_time or model_start_time)
     if start is None and require and source.min_lead_hours > 0:
         raise ValueError(
-            f"sources.{source.name}: min_lead_hours 需要起报时间；"
+            f"sources.{source.name}: lead_hours 下限大于0时需要起报时间；"
             "未找到起报目录或 SIMULATION_START_DATE/START_DATE 属性，请在配置中填写 init_time"
         )
     return start.astimezone(timezone.utc) if start is not None else None
@@ -84,6 +85,7 @@ def wrf_filename_time(path: Path, zone: ZoneInfo) -> datetime | None:
 
 def iter_wrf_files(
     source: SourceConfig, period: PeriodConfig, progress: Callable[[str], None] | None = None,
+    *, windows: tuple[tuple[datetime, datetime], ...] | None = None,
 ) -> Iterator[Path]:
     """打开 NetCDF 前按起报目录和文件名时间段排除无关资料。
 
@@ -91,6 +93,16 @@ def iter_wrf_files(
     结束边界，因此即使单个文件含多个时次，也能安全筛选。
     """
     zone = ZoneInfo(source.timezone)
+    # 空间图可只请求离散时刻/窗口；合并后按二分查找，避免逐文件遍历全部出图时刻。
+    merged = []
+    for a, b in sorted(windows or ()):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = merged[-1][0], max(b, merged[-1][1])
+        else:
+            merged.append((a, b))
+    window_ends = [b for _, b in merged]
+    if windows is not None and not merged:
+        return
     scanned = skipped = directories_skipped = candidates = 0
     last_report = monotonic()
 
@@ -142,11 +154,17 @@ def iter_wrf_files(
         lower = max(period.start, cutoff) if cutoff is not None else period.start
         # 文件名不早于起报；未知起报时，文件名加最长时效仍是保守上界。
         latest = (start or time) + timedelta(hours=source.max_lead_hours) if start or time else None
-        overlaps_period = (time is None or (time <= period.end
+        upper = min(period.end, latest) if latest is not None else period.end
+        overlaps_period = (time is None or (time <= upper
                            and (next_time is None or next_time > lower)))
+        overlaps_windows = True
+        if windows is not None and time is not None:
+            i = bisect_left(window_ends, max(lower, time))
+            overlaps_windows = (i < len(merged) and merged[i][0] <= upper
+                                and (next_time is None or merged[i][0] < next_time))
         if ((cutoff is not None and cutoff > period.end)
                 or (latest is not None and latest < period.start)
-                or not overlaps_period):
+                or not overlaps_period or not overlaps_windows):
             skipped += 1
         else:
             candidates += 1

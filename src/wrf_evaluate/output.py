@@ -23,10 +23,18 @@ def create_run_directory(config: Config) -> Path:
             if not path.exists():
                 raise  # 父路径被文件占用等错误不是运行名称碰撞。
             sequence += 1
+    snapshots = {"config.toml": config.config_bytes}
+    if config.source_config_bytes is not None:
+        source_name = config.source_config_path.name if config.source_config_path else "config.sources.toml"
+        if source_name.casefold() == "config.toml":
+            source_name = "config.sources.toml"
+        snapshots[source_name] = config.source_config_bytes
     try:
-        (path / "config.toml").write_bytes(config.config_bytes)
+        for name, content in snapshots.items():
+            (path / name).write_bytes(content)
     except OSError:
-        (path / "config.toml").unlink(missing_ok=True)
+        for name in snapshots:
+            (path / name).unlink(missing_ok=True)
         path.rmdir()
         raise
     return path

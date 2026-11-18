@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from wrf_evaluate.config import DEFAULT_COLUMN_MAPPING, PeriodConfig
-from wrf_evaluate.station import StationReadError, iter_regional_observations
+from wrf_evaluate.station import StationReadError, iter_station_observations
 
 
 class StationParsingTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class StationParsingTests(unittest.TestCase):
 
     def records(self, rows, header=None, timezone="UTC", column_mapping=None):
         self.sheet.iter_rows.return_value = iter([self.header if header is None else header, *rows])
-        return iter_regional_observations(self.path, timezone, column_mapping)
+        return iter_station_observations(self.path, timezone, column_mapping)
 
     def test_renamed_headers_read_same_values(self):
         mapping = {"temperature_2m": " 温度℃ ", "time": "时间"}
@@ -34,8 +34,32 @@ class StationParsingTests(unittest.TestCase):
         observation, = self.records([self.row], header=header, column_mapping=mapping)
         self.assertEqual(observation.values['temperature_2m'], -12.1)
         self.assertEqual(observation.time.second, 5)
-        self.assertEqual(observation.values['wind_speed_10m'], 2.1)
+        self.assertEqual(observation.values['wind_speed'], 2.1)
         self.assertEqual(observation.values['precipitation'], 0.4)
+
+    def test_selected_sheet_and_fields_are_used(self):
+        self.sheet.iter_rows.return_value = iter([['id', 'time', 'temperature'],
+                                                  ['Y5012', '20240102030405', -5]])
+        row, = iter_station_observations(
+            self.path, 'UTC', {'station_id': 'id', 'time': 'time', 'temperature_2m': 'temperature'},
+            fields=('temperature_2m',), sheet_name='observations',
+        )
+        self.book.get_sheet_by_name.assert_called_once_with('observations')
+        self.assertEqual(row.values, {'temperature_2m': -5})
+
+    def test_wind_uses_configured_column_without_assuming_averaging_period(self):
+        observation, = self.records([self.row], column_mapping={'wind_speed': '2min平均风速(m/s)'})
+        self.assertEqual(observation.values['wind_speed'], 9.9)
+
+    def test_automatic_id_rejects_multiple_stations_even_outside_period(self):
+        other = self.row.copy()
+        other[2], other[4] = 'Y5056', '20230102030405'
+        period = PeriodConfig(datetime(2024, 1, 1, tzinfo=ZoneInfo('UTC')),
+                              datetime(2024, 1, 3, tzinfo=ZoneInfo('UTC')))
+        self.sheet.iter_rows.return_value = iter([self.header, self.row, other])
+        with self.assertRaisesRegex(StationReadError, '多个站号.*station_id'):
+            list(iter_station_observations(self.path, 'UTC', single_station=True, period=period))
+        self.book.__exit__.assert_called_once()
 
     def test_filtering_skips_unselected_values_and_preserves_row_numbers(self):
         outside = self.row.copy()
@@ -45,7 +69,7 @@ class StationParsingTests(unittest.TestCase):
         self.sheet.iter_rows.return_value = iter([self.header, outside, other, self.row])
         period = PeriodConfig(datetime(2024, 1, 1, tzinfo=ZoneInfo('UTC')),
                               datetime(2024, 1, 3, tzinfo=ZoneInfo('UTC')))
-        row, = iter_regional_observations(self.path, 'UTC', station_ids={'Y5012'}, period=period)
+        row, = iter_station_observations(self.path, 'UTC', station_ids={'Y5012'}, period=period)
         self.assertEqual(row.row, 4)
         self.assertEqual(row.values['temperature_2m'], -12.1)
 
@@ -60,9 +84,29 @@ class StationParsingTests(unittest.TestCase):
         self.assertEqual(observation.time, datetime(2024, 1, 2, 3, 4, 5, tzinfo=ZoneInfo("Asia/Shanghai")))
         self.assertEqual(observation.values['temperature_2m'], -12.1)
         self.assertEqual(observation.values['relative_humidity_2m'], 64)
-        self.assertEqual(observation.values['wind_speed_10m'], 2.1)
+        self.assertEqual(observation.values['wind_speed'], 2.1)
         self.assertEqual((observation.path, observation.row, observation.station_id), (self.path, 2, "Y5012"))
         self.book.__exit__.assert_called_once()
+
+    def test_configured_missing_markers_are_checked_before_numeric_parsing(self):
+        row = self.row.copy()
+        row[3], row[0] = "-9999", "M"
+        self.sheet.iter_rows.return_value = iter([self.header, row])
+        observation, = iter_station_observations(
+            self.path, "UTC", missing_values=(-9999, "M"),
+        )
+        self.assertIsNone(observation.values["temperature_2m"])
+        self.assertIsNone(observation.values["relative_humidity_2m"])
+
+    def test_custom_excel_time_format_and_native_datetime_both_parse(self):
+        for value, time_format in (("2024/01/02 03:04:05", "%Y/%m/%d %H:%M:%S"),
+                                   (datetime(2024, 1, 2, 3, 4, 5), "%Y%m%d%H%M%S")):
+            with self.subTest(value=value):
+                custom = self.row.copy()
+                custom[4] = value
+                self.sheet.iter_rows.return_value = iter([self.header, custom])
+                row, = iter_station_observations(self.path, "UTC", time_format=time_format)
+                self.assertEqual(row.time, datetime(2024, 1, 2, 3, 4, 5, tzinfo=ZoneInfo("UTC")))
 
     def test_blank_cells_remain_missing_and_empty_rows_keep_original_row_numbers(self):
         row = [None, 9.9, "Y5012", " ", "20240102030405", "", ""]
@@ -70,7 +114,7 @@ class StationParsingTests(unittest.TestCase):
         self.assertEqual(observation.row, 3)
         self.assertIsNone(observation.values['temperature_2m'])
         self.assertIsNone(observation.values['relative_humidity_2m'])
-        self.assertIsNone(observation.values['wind_speed_10m'])
+        self.assertIsNone(observation.values['wind_speed'])
         self.assertIsNone(observation.values['precipitation'])
 
     def test_missing_or_duplicate_header_raises(self):
@@ -124,7 +168,7 @@ class StationParsingTests(unittest.TestCase):
         self.sheet.start = (0, 0)
         self.sheet.iter_rows.return_value = iter(())
         with self.assertRaisesRegex(StationReadError, 'station.xlsx'):
-            list(iter_regional_observations(self.path, 'UTC'))
+            list(iter_station_observations(self.path, 'UTC'))
 
     def test_rain_mapping_preserves_reset_values_and_missing_values(self):
         mapping = {**DEFAULT_COLUMN_MAPPING, 'precipitation': '雨量'}

@@ -104,15 +104,15 @@ class VariableTests(unittest.TestCase):
             relative_humidity(values, units | {'pressure': 'bad'}, spec)
 
     def test_wrf_wind_uses_two_components_and_rejects_single_component(self):
-        spec = DEFAULT_VARIABLES['wrf']['wind_speed_10m']
+        spec = DEFAULT_VARIABLES['wrf']['wind_speed']
         self.assertEqual(spec.native_variables, ('U10', 'V10'))
         self.assertEqual(spec.time_kind, 'instant')
         for value in ('U10', 'V10', 'U', 'V'):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, '风分量'):
-                parse_variables({'wind_speed_10m': {'variable': value}}, 'wrf')
+                parse_variables({'wind_speed': {'variable': value}}, 'wrf')
         custom = dict(parse_variables({
-            'wind_speed_10m': {'components': ['U10_EARTH', 'V10_EARTH']},
-        }, 'wrf'))['wind_speed_10m']
+            'wind_speed': {'components': ['U10_EARTH', 'V10_EARTH']},
+        }, 'wrf'))['wind_speed']
         self.assertEqual(custom.native_variables, ('U10_EARTH', 'V10_EARTH'))
 
     def test_mapping_is_one_native_variable_without_implicit_components(self):
@@ -129,8 +129,8 @@ class VariableTests(unittest.TestCase):
 
     def test_mean_override_discards_inherited_interval_when_changed_to_instant(self):
         spec = dict(parse_variables({
-            'wind_speed_10m': {'variable': '风速', 'time_kind': 'instant'},
-        }, 'regional'))['wind_speed_10m']
+            'wind_speed': {'variable': '风速', 'time_kind': 'instant'},
+        }, 'station'))['wind_speed']
         self.assertIsNone(spec.interval)
         self.assertIsNone(spec.timestamp)
 
@@ -220,7 +220,7 @@ class SeriesTests(unittest.TestCase):
 
     def test_period_bounds_must_be_ordered_and_unambiguous(self):
         time = lambda minutes: self.start + timedelta(minutes=minutes)
-        for bounds in (((time(0), time(60)), (time(0), time(90))),
+        for bounds in (((time(10), time(60)), (time(0), time(90))),
                        ((time(0), time(90)), (time(30), time(60)))):
             with self.subTest(bounds=bounds), self.assertRaises(ValueError):
                 Series('test', (time(60), time(90)), (1, 2), bounds, 'sum', 'mm')
@@ -239,15 +239,34 @@ class SeriesTests(unittest.TestCase):
                      (gap.bounds[0], gap.bounds[2]), 'sum', 'mm')
         self.assertIsNone(hourly_precipitation(gap))
 
-    def test_raw_rain_preserves_decreases_and_cannot_compute_metrics(self):
+    def test_hour_to_date_rain_preserves_values_and_compares_complete_hours(self):
         from wrf_evaluate.evaluation import compare_series
 
-        spec = dict(parse_variables({'precipitation': {'variable': '小时雨量', 'units': 'mm'}}, 'regional'))['precipitation']
-        curve = self.normalize('precipitation', spec, [0, 5, 10], [0.3, 0.8, 0.2], 'mm')
-        self.assertEqual(curve.values, (0.3, 0.8, 0.2))
-        self.assertEqual(curve.bounds, ())
-        with self.assertRaisesRegex(ValueError, '仅绘图'):
-            compare_series(curve, curve, timedelta(0), 'precipitation')
+        spec = dict(parse_variables({'precipitation': {'variable': '小时雨量', 'units': 'mm'}}, 'station'))['precipitation']
+        curve = self.normalize('precipitation', spec, [5, 30, 60, 65, 120], [0.1, 0.8, 1.3, 0.2, 1], 'mm')
+        self.assertEqual(curve.values, (0.1, 0.8, 1.3, 0.2, 1))
+        self.assertEqual([(b - a).total_seconds() for a, b in curve.bounds], [300, 1800, 3600, 300, 3600])
+        forecast = self.normalize('precipitation', VariableConfig('RAIN', 'mm', 'cumulative'),
+                                  [0, 60, 120], [0, 1.5, 2.5], 'mm')
+        result, = compare_series(forecast, curve, timedelta(0), 'precipitation')
+        self.assertEqual(result.interval_seconds, 3600)
+        self.assertEqual(result.metrics.sample_count, 2)
+        self.assertAlmostEqual(result.metrics.mae, 0.1)
+
+    def test_hour_to_date_window_is_explicit_and_cannot_be_used_as_rain_rate(self):
+        for options in (
+            {'time_kind': 'raw'},
+            {'window': 'unknown'},
+            {'window': 'hour_to_date', 'interval': '30min'},
+            {'window': 'hour_to_date', 'timestamp': 'start'},
+            {'window': 'hour_to_date', 'units': 'mm/h'},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                parse_variables({'precipitation': options}, 'station')
+        spec = dict(parse_variables({'precipitation': {
+            'time_kind': 'sum', 'interval': '1h', 'timestamp': 'end',
+        }}, 'station'))['precipitation']
+        self.assertEqual(spec.window, 'rolling')
 
 
 if __name__ == '__main__':

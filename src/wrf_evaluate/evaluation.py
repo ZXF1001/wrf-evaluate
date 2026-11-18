@@ -31,12 +31,15 @@ def _nearest_pairs(forecast: Series, observation: Series, tolerance: timedelta) 
     times = tuple(time.astimezone(timezone.utc) for time in forecast.times)
     candidates = []
     for obs_index, time in enumerate(observation.times):
+        if observation.values[obs_index] is None:
+            continue
         time = time.astimezone(timezone.utc)
         first = bisect_left(times, time - tolerance)
         last = bisect_right(times, time + tolerance)
         candidates.extend(
             (abs(times[index] - time), obs_index, index)
             for index in range(first, last)
+            if forecast.values[index] is not None
         )
     candidates.sort()
     used_forecasts, used_observations = set(), set()
@@ -109,6 +112,9 @@ def _build_comparisons(forecast: Series, observation: Series, groups: dict[float
                        field: str, thresholds: tuple[float, ...]) -> tuple[Comparison, ...]:
     results = []
     for seconds, pairs in groups.items():
+        # 有实际配对时不输出其他窗口长度的空行；全无配对仍保留诊断行。
+        if not pairs and any(groups.values()):
+            continue
         valid = [(a, b) for a, b in pairs if a is not None and b is not None]
         predicted = [a for a, _ in valid]
         observed = [b for _, b in valid]
@@ -131,14 +137,12 @@ def compare_series(
         raise ValueError("时间配对容差须为非负 timedelta")
     if forecast.unit != observation.unit:
         raise ValueError("指标计算前须统一单位")
-    if "raw" in {forecast.statistic, observation.statistic}:
-        raise ValueError("原始降水记录未定义时间窗口，仅绘图，不参与指标")
     if forecast.statistic == observation.statistic == "instant":
         groups = {None: _nearest_pairs(forecast, observation, tolerance)}
     elif forecast.statistic == observation.statistic:
         groups = _period_pairs(forecast, observation)
-    elif field == "wind_speed_10m" and {forecast.statistic, observation.statistic} == {"instant", "mean"}:
-        # 已确认的口径：模式瞬时风速与站点10分钟平均风速按时刻对比。
+    elif field == "wind_speed" and {forecast.statistic, observation.statistic} == {"instant", "mean"}:
+        # 模式瞬时风速与用户指定的平均风速按时刻对比；不伪造平均风速。
         groups = {None: _nearest_pairs(forecast, observation, tolerance)}
     else:
         raise ValueError(
@@ -156,14 +160,12 @@ def compare_forecast(
     """瞬时序列使用最新合并结果；时段量按完整窗口选择最新可覆盖的批次。"""
     if not isinstance(tolerance, timedelta) or tolerance < timedelta(0):
         raise ValueError("时间配对容差须为非负 timedelta")
-    if "raw" in {forecast.series.statistic, observation.statistic}:
-        raise ValueError("原始降水记录未定义时间窗口，仅绘图，不参与指标")
     if forecast.series.statistic == observation.statistic == "instant":
         return compare_series(forecast.series, observation, tolerance, field, thresholds)
     if forecast.series.unit != observation.unit:
         raise ValueError("指标计算前须统一单位")
     if forecast.series.statistic != observation.statistic:
-        if not (field == "wind_speed_10m" and {forecast.series.statistic, observation.statistic} == {"instant", "mean"}):
+        if not (field == "wind_speed" and {forecast.series.statistic, observation.statistic} == {"instant", "mean"}):
             raise ValueError(f"{forecast.series.label} / {observation.label}: 时间含义不同，不能直接计算指标")
         return compare_series(forecast.series, observation, tolerance, field, thresholds)
     selected = {}

@@ -4,7 +4,9 @@ import unittest
 
 import numpy as np
 
-from wrf_evaluate.spatial import SpatialMatchError, nearest_grid_point, nearest_rectilinear_point
+from wrf_evaluate.spatial import (
+    SpatialMatchError, nearest_grid_point, nearest_rectilinear_point, sample_rectilinear_grid,
+)
 
 
 class NearestGridPointTests(unittest.TestCase):
@@ -46,6 +48,23 @@ class NearestGridPointTests(unittest.TestCase):
 
 
 class RectilinearPointTests(unittest.TestCase):
+    def test_vectorized_sampling_matches_spherical_search_and_keeps_missing(self):
+        rng = np.random.default_rng(42)
+        x, y = rng.uniform(60, 159, (2, 20)), rng.uniform(1, 80, (2, 20))
+        for lons in (np.linspace(60, 159, 24), np.linspace(159, 60, 24)):
+            for lats in (np.linspace(1, 80, 17), np.linspace(80, 1, 17)):
+                values = np.ma.asarray(np.arange(len(lons) * len(lats)).reshape(len(lats), len(lons)))
+                result = sample_rectilinear_grid(lons, lats, values, x, y)
+                expected = np.empty(x.shape)
+                for index in np.ndindex(x.shape):
+                    point = nearest_rectilinear_point(x[index], y[index], lons, lats)
+                    expected[index] = values[point.row, point.column]
+                np.testing.assert_array_equal(result, expected)
+        values = np.ma.array([[1, 2], [3, 4]], mask=[[1, 0], [0, 0]])
+        result = sample_rectilinear_grid([87, 88], [43, 44], values,
+                                         np.array([[87, 86, np.nan]]), np.array([[43, 43, 43]]))
+        self.assertTrue(result.mask.all())
+
     def test_axis_search_matches_full_spherical_grid_for_ascending_and_descending_axes(self):
         for longitudes in (np.linspace(60, 159, 24), np.linspace(159, 60, 24)):
             for latitudes in (np.linspace(1, 80, 17), np.linspace(80, 1, 17)):

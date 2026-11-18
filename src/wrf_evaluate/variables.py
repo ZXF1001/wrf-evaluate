@@ -12,7 +12,7 @@ import numpy as np
 DISPLAY_NAMES = {
     "temperature_2m": "2m气温",
     "relative_humidity_2m": "2m相对湿度",
-    "wind_speed_10m": "10m风速",
+    "wind_speed": "风速",
     "precipitation": "降水量",
     "surface_shortwave_down": "地表向下短波辐射",
     "surface_longwave_down": "地表向下长波辐射",
@@ -20,7 +20,7 @@ DISPLAY_NAMES = {
 UNITS = {
     "temperature_2m": "℃",
     "relative_humidity_2m": "%",
-    "wind_speed_10m": "m/s",
+    "wind_speed": "m/s",
     "precipitation": "mm",
     "surface_shortwave_down": "W/m²",
     "surface_longwave_down": "W/m²",
@@ -48,6 +48,7 @@ class VariableConfig:
     product: str | None = None
     components: tuple[str, ...] = ()
     inputs: tuple[tuple[str, InputVariable], ...] = ()
+    window: str = "rolling"
 
     @property
     def native_variables(self) -> tuple[str, ...]:
@@ -65,11 +66,11 @@ class VariableConfig:
 
 
 # Defaults are only for fields verified in the supplied data templates.
-# Station precipitation is drawn as recorded until its exact time window is configured.
+# 样例站点降水按本小时累计；整点记录为刚结束的一小时总量。
 DEFAULT_VARIABLES = {
     "wrf": {
         "temperature_2m": VariableConfig("T2"),
-        "wind_speed_10m": VariableConfig(None, components=("U10", "V10")),
+        "wind_speed": VariableConfig(None, components=("U10", "V10")),
         "relative_humidity_2m": VariableConfig(None, inputs=(
             ("mixing_ratio", InputVariable("Q2")),
             ("temperature", InputVariable("T2")),
@@ -78,26 +79,29 @@ DEFAULT_VARIABLES = {
     },
     "cldas": {
         "temperature_2m": VariableConfig("TAIR", product="TMP"),
+        "wind_speed": VariableConfig("WIND", product="WIN"),
         "relative_humidity_2m": VariableConfig(None, inputs=(
             ("specific_humidity", InputVariable("QAIR", product="SHU")),
             ("temperature", InputVariable("TAIR", product="TMP")),
             ("pressure", InputVariable("PAIR", product="PRS")),
         )),
     },
-    "regional": {
+    "station": {
         "station_id": VariableConfig("区站号"),
         "time": VariableConfig("观测时间"),
         "temperature_2m": VariableConfig("气温(°)", "degC"),
         "relative_humidity_2m": VariableConfig("相对湿度(%RH)", "%"),
-        "wind_speed_10m": VariableConfig(
+        "wind_speed": VariableConfig(
             "10min平均风速(m/s)", "m/s", "mean", timedelta(minutes=10), "end",
         ),
-        "precipitation": VariableConfig("小时降水量(mm)", "mm", "raw"),
+        "precipitation": VariableConfig(
+            "小时降水量(mm)", "mm", "sum", timedelta(hours=1), "end", window="hour_to_date",
+        ),
     },
 }
 
 DEFAULT_COLUMN_MAPPING = {
-    key: spec.variable for key, spec in DEFAULT_VARIABLES["regional"].items()
+    key: spec.variable for key, spec in DEFAULT_VARIABLES["station"].items()
 }
 
 
@@ -114,10 +118,10 @@ def duration(value: object) -> timedelta:
 
 
 def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig], ...]:
-    """Parse [sources.<name>.variables] while retaining safe template defaults."""
+    """读取要素的来源映射或站点 Excel 映射，省略项沿用对应模板。"""
     if not isinstance(value, dict):
         raise ValueError("应为字段映射表")
-    allowed = set(DISPLAY_NAMES) | ({"station_id", "time"} if kind == "regional" else set())
+    allowed = set(DISPLAY_NAMES) | ({"station_id", "time"} if kind in {"station"} else set())
     if unknown := value.keys() - allowed:
         raise ValueError(f"未知字段 {', '.join(sorted(unknown))}；请使用统一英文要素名")
 
@@ -126,15 +130,16 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
     for field, options in value.items():
         if not isinstance(options, dict):
             raise ValueError(
-                f"{field}: 请使用子表并填写 variable，例如 "
-                f"[sources.<名称>.variables.{field}]"
+                f"{field}: 请使用映射表，例如 {{ variable = \"原字段名\" }}"
             )
         simple_field = field in {"station_id", "time"}
         allowed_options = {"variable"} if simple_field else {
             "variable", "units", "time_kind", "interval", "timestamp",
         } | ({"product"} if kind == "cldas" else set())
-        if kind == "wrf" and field == "wind_speed_10m":
+        if kind == "wrf" and field == "wind_speed":
             allowed_options.add("components")
+        if kind in {"station"} and field == "precipitation":
+            allowed_options.add("window")
         if kind in {"wrf", "cldas"} and field == "relative_humidity_2m":
             allowed_options.add("inputs")
         if unknown := options.keys() - allowed_options:
@@ -164,12 +169,12 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
             if not isinstance(text, str) or not text.strip():
                 raise ValueError(f"{field}.variable: 应为非空字符串")
             text = text.strip()
-            if kind == "wrf" and field == "wind_speed_10m" and text.upper() in {"U10", "V10", "U", "V"}:
+            if kind == "wrf" and field == "wind_speed" and text.upper() in {"U10", "V10", "U", "V"}:
                 raise ValueError(f"{field}.variable: {text} 是风分量，不是风速；请使用 components = [\"U10\", \"V10\"]")
             updates["variable"] = text
             updates["components"] = ()
             updates["inputs"] = ()
-        for key in ("units", "time_kind", "timestamp", "product"):
+        for key in ("units", "time_kind", "timestamp", "product", "window"):
             if key not in options:
                 continue
             text = options[key]
@@ -182,17 +187,27 @@ def parse_variables(value: object, kind: str) -> tuple[tuple[str, VariableConfig
         # Changing the statistic invalidates any interval inherited from a template.
         if "time_kind" in updates and base and updates["time_kind"] != base.time_kind:
             base = replace(base, interval=None, timestamp=None)
+        # 用户重定义窗口时不继承模板的本小时累计规则。
+        if {"time_kind", "interval", "timestamp"}.intersection(options) and "window" not in options:
+            updates["window"] = "rolling"
         spec = replace(base or VariableConfig(options.get("variable")), **updates)
         if not simple_field:
             validate_variable(field, spec)
         result[field] = spec
 
-    if kind == "regional":
+    if kind in {"station"}:
         merged = defaults | result
         names = [spec.variable for spec in merged.values()]
         if len(names) != len(set(names)):
             raise ValueError("映射后的 Excel 表头不能重复")
     return tuple(result.items())
+
+
+def normalized_statistic(field: str, spec: VariableConfig) -> str:
+    """累计量转时段量；辐射能量转为窗口内平均通量。"""
+    if field.startswith("surface_") and spec.time_kind in {"sum", "cumulative"}:
+        return "mean"
+    return "sum" if spec.time_kind == "cumulative" else spec.time_kind
 
 
 def _parse_humidity_inputs(value: object, kind: str) -> tuple[tuple[str, InputVariable], ...]:
@@ -233,20 +248,26 @@ def validate_variable(field: str, spec: VariableConfig) -> None:
         for role, item in spec.inputs:
             if item.units is not None:
                 convert_value(role, None, item.units, "instant")
-    if spec.time_kind not in {"instant", "mean", "sum", "cumulative", "raw"}:
-        raise ValueError(
-            f"{field}.time_kind: 须明确填写 instant / mean / sum / cumulative；站点降水可用 raw 仅绘图"
-        )
+    if spec.time_kind not in {"instant", "mean", "sum", "cumulative"}:
+        raise ValueError(f"{field}.time_kind: 须填写 instant / mean / sum / cumulative")
     if spec.time_kind in {"mean", "sum"}:
         if spec.interval is None or spec.timestamp not in {"start", "end"}:
             raise ValueError(f"{field}: mean/sum 须填写 interval 和 timestamp = start/end")
     elif spec.interval is not None or spec.timestamp is not None:
         raise ValueError(f"{field}: {spec.time_kind} 不使用 interval 或 timestamp")
-    if spec.time_kind == "raw" and field != "precipitation":
-        raise ValueError("raw 仅用于尚未确认时间窗口的站点降水绘图")
-    if field == "precipitation" and spec.time_kind not in {"sum", "cumulative", "raw"}:
-        raise ValueError("precipitation: 使用 sum、cumulative 或站点绘图专用的 raw")
-    if field in {"temperature_2m", "relative_humidity_2m", "wind_speed_10m"} and spec.time_kind not in {"instant", "mean"}:
+    if spec.window not in {"rolling", "hour_to_date"}:
+        raise ValueError(f"{field}.window: 仅支持 rolling / hour_to_date")
+    if spec.window == "hour_to_date" and not (
+        field == "precipitation" and spec.time_kind == "sum"
+        and spec.interval == timedelta(hours=1) and spec.timestamp == "end"
+    ):
+        raise ValueError("hour_to_date 仅用于本小时降水：sum、interval=1h、timestamp=end")
+    if (spec.window == "hour_to_date" and spec.units
+            and spec.units.lower().replace(" ", "") in {"mm/h", "mmh-1", "mmh^-1"}):
+        raise ValueError("本小时累计降水须为雨量，不能是 mm/h 雨强")
+    if field == "precipitation" and spec.time_kind not in {"sum", "cumulative"}:
+        raise ValueError("precipitation: 使用 sum 或 cumulative")
+    if field in {"temperature_2m", "relative_humidity_2m", "wind_speed"} and spec.time_kind not in {"instant", "mean"}:
         raise ValueError(f"{field}: 只支持 instant 或 mean")
 
 
@@ -277,7 +298,7 @@ def convert_value(
             scale = 100.0
         elif unit not in {"%", "%rh", "percent"}:
             raise ValueError(f"相对湿度单位应为 % 或 1，不能直接映射比湿: {units!r}")
-    elif field == "wind_speed_10m":
+    elif field == "wind_speed":
         if unit not in {"m/s", "ms-1", "ms^-1"}:
             raise ValueError(f"风速单位应为 m/s: {units!r}")
     elif field == "precipitation":

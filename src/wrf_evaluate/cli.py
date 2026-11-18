@@ -1,12 +1,25 @@
-"""命令行入口：配置检查、文件扫描和 WRF/CLDAS 元数据核查。"""
+"""命令行入口：运行时自动校验配置，输出进度与错误。"""
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .catalog import iter_source_files, scan_source
 from .config import Config, ConfigError, SourceConfig, load_config
+
+
+def _show_stations(config: Config) -> None:
+    print(f"配置站点: {len(config.points)} 个")
+    for point in config.points:
+        tolerance = point.time_tolerance
+        station_id = f"，实测站号 {point.station_id}" if point.station_id is not None else ""
+        print(f"  {point.name}: 经度 {point.longitude:g}，纬度 {point.latitude:g}{station_id}；"
+              f"瞬时指标容差 ±{tolerance.total_seconds():g} 秒")
+        if point.excel is not None:
+            print(f"    Excel: {len(point.excel.files)} 个；时区 {point.excel.timezone}；工作表 {point.excel.sheet}")
+            for path in point.excel.files:
+                print(f"      {path}")
 
 
 def _inspect_cldas(source: SourceConfig) -> None:
@@ -33,37 +46,41 @@ def _match_times(config: Config) -> None:
     from .matching import iter_time_matches
 
     summaries = {}
+    tolerances = {p.time_tolerance
+                  for p in config.points} or {timedelta(minutes=1)}
     log_timezone = ZoneInfo(config.display_timezone)
 
     def progress(message: str) -> None:
         now = datetime.now(log_timezone)
         print(f"[{now:%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
-    for match in iter_time_matches(config.sources, config.time_tolerance,
+    # 用最大容差找一次最近候选，再按各站点容差汇总，避免重复扫描原始文件。
+    for match in iter_time_matches(config.sources, max(tolerances),
                                    period=config.period, progress=progress):
-        key = (match.forecast.source, match.cldas_source, match.family, match.product)
-        paired, missing, max_offset = summaries.get(key, (0, 0, 0.0))
-        if match.observation is None:
-            missing += 1
-        else:
-            paired += 1
-            max_offset = max(max_offset, abs(match.offset.total_seconds()))
-        summaries[key] = paired, missing, max_offset
-    print(f"最近时次配对，容差 ±{config.time_tolerance.total_seconds():g} 秒（含边界）；CLDAS 取最新制作版本。")
-    print("WRF 每个有效时刻选满足 min_lead_hours 的最新起报；这里只查找时间候选，同一实况仍可重复对应。")
+        for tolerance in tolerances:
+            key = (tolerance, match.forecast.source, match.cldas_source, match.family, match.product)
+            paired, missing, max_offset = summaries.get(key, (0, 0, 0.0))
+            if match.observation is None or abs(match.offset) > tolerance:
+                missing += 1
+            else:
+                paired += 1
+                max_offset = max(max_offset, abs(match.offset.total_seconds()))
+            summaries[key] = paired, missing, max_offset
+    print("最近时次候选按站点容差分别汇总（含边界）；CLDAS 取最新制作版本。")
+    print("WRF 每个有效时刻选满足 lead_hours 范围的最新起报；这里只查找时间候选，同一实况仍可重复对应。")
     print("仅核验时间候选，不读取气象场；未检查降水时段或执行插值、指标计算。")
-    for (wrf, cldas, family, product), (paired, missing, max_offset) in sorted(summaries.items()):
+    for (tolerance, wrf, cldas, family, product), (paired, missing, max_offset) in sorted(summaries.items()):
         offset = f"{max_offset:g} 秒" if paired else "无配对"
-        print(f"  {wrf} -> {cldas} {family}/{product}: 配对 {paired}，未配对 {missing}，最大绝对时差 {offset}")
+        print(f"  容差 ±{tolerance.total_seconds():g} 秒，{wrf} -> {cldas} {family}/{product}: "
+              f"配对 {paired}，未配对 {missing}，最大绝对时差 {offset}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="WRF 检验工具")
     parser.add_argument("--config", default="config.toml", help="配置文件路径，默认 config.toml")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("check", help="检查配置和输入目录，不读取数据内容")
     scan = commands.add_parser("scan", help="统计原始文件数量、大小及少量示例")
-    scan.add_argument("--source", help="仅扫描指定来源，如 wrf 或 regional")
+    scan.add_argument("--source", help="仅扫描指定来源，如 wrf 或 cldas")
     commands.add_parser("inspect", help="读取 WRF/CLDAS 元数据并显示配置点位")
     commands.add_parser("plot", help="按配置要素输出对比 PNG 和指标 CSV")
     commands.add_parser("match", help="按配置的时间容差核验 WRF—CLDAS 配对覆盖，不计算指标")
@@ -72,24 +89,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         enabled = [source for source in config.sources if source.enabled]
-        if args.command == "check":
-            print(f"配置有效，已启用 {len(enabled)} 个数据源。")
-            for source in enabled:
-                print(f"  {source.name} ({source.kind}, {source.timezone}): {source.root}")
-                if source.kind == "wrf":
-                    print(f"    最低预报时效: {source.min_lead_hours:g} 小时；"
-                          f"最长预报时效: {source.max_lead_hours:g} 小时；同一有效时刻选最新合格起报")
-                if source.kind in {"regional", "national"}:
-                    print(f"    显式指定 {len(source.files)} 个 Excel 文件" + ("；尚未选入实测文件" if not source.files else ""))
-            print(f"输出父目录: {config.output_dir}；运行目录: {config.output_name}_运行时间（本命令不创建目录）")
-            print(f"绘图显示时区: {config.display_timezone}")
-            print(f"空间填色图间隔: {config.map_interval.total_seconds() / 3600:g} 小时，使用相同 period 和 elements")
-            print(f"指标时间配对容差: ±{config.time_tolerance.total_seconds():g} 秒（含边界）")
-            print(f"配置点位: {len(config.points)} 个")
-            if config.period is not None:
-                print(f"配置时段: {config.period.start.isoformat()} -> {config.period.end.isoformat()}（含端点）")
-            return 0
-
         if args.command == "plot":
             log_timezone = ZoneInfo(config.display_timezone)
 
@@ -100,23 +99,11 @@ def main(argv: list[str] | None = None) -> int:
             progress("加载检验与绘图模块…")
             from .workflow import plot_comparisons
 
-            for source in enabled:
-                if source.kind in {"regional", "national"} and not source.files:
-                    print(f"提示: {source.name}.files 为空，本次不绘制该来源。")
             for result in plot_comparisons(config, progress=progress):
-                print(f"已生成 {result.point.name}: {result.path}")
-                for curve in result.series:
-                    valid = sum(value is not None for value in curve.values)
-                    print(f"  {curve.label}: {len(curve.times)} 个输出时次，{valid} 个有效值；"
-                          f"{curve.times[0].isoformat()} -> {curve.times[-1].isoformat()}")
-                print(f"  指标: {result.metrics_path}")
-                for comparison in result.comparisons:
-                    metrics = comparison.metrics
-                    print(f"  {comparison.forecast} -> {comparison.observation}: "
-                          f"时间配对 {comparison.matched_times}，有效样本 {metrics.sample_count}")
-                    if not metrics.sample_count:
-                        print("    提示: 没有共同有效样本，指标留空；请检查时次/区间覆盖、容差和缺测情况。")
-                sys.stdout.flush()
+                for path in result.paths:
+                    progress(f"已生成 {result.point.name}: {path}")
+                if result.metrics_path is not None:
+                    progress(f"指标: {result.metrics_path}")
             progress("本次检验完成。")
             return 0
 
@@ -154,10 +141,7 @@ def main(argv: list[str] | None = None) -> int:
                     print("  未匹配文件，请检查 root 和 patterns。")
             for source in cldas_sources:
                 _inspect_cldas(source)
-            print(f"配置点位: {len(config.points)} 个")
-            for point in config.points:
-                station = f"，实测站号 {point.station_id}" if point.station_id is not None else ""
-                print(f"  {point.name}: 经度 {point.longitude:g}，纬度 {point.latitude:g}{station}")
+            _show_stations(config)
             return 0
 
         if args.source:
@@ -174,11 +158,11 @@ def main(argv: list[str] | None = None) -> int:
             for example in result.examples:
                 print(f"  {example}")
             if not result.file_count:
-                if source.kind in {"regional", "national"}:
+                if source.kind in {"station"}:
                     print("  提示: files 为空，尚未选入实测 Excel；请在配置中明确填写文件路径。")
                 else:
                     print("  提示: 没有匹配文件，请检查 root 和 patterns。")
         return 0
     except (OSError, ValueError) as exc:
-        print(f"错误: {exc}", file=sys.stderr)
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 错误: {exc}；若已生成部分文件，请以此错误为准，本次未完成。", file=sys.stderr, flush=True)
         return 2

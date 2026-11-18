@@ -58,7 +58,7 @@ def iter_source_files(
     """站点直接返回配置文件列表；网格来源流式扫描，不保存全量清单。"""
     if not source.enabled:
         return
-    if source.kind in {"regional", "national"}:
+    if source.kind in {"station"}:
         yield from source.files
         return
     patterns = [tuple(pattern.split("/")) for pattern in source.patterns]
